@@ -4,3 +4,4 @@ pages-dist/_worker.js
 .wrangler/
 .dev.vars
 wrangler.toml
+踩坑笔记.md

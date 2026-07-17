@@ -131,6 +131,7 @@ export default {
 
             // 从 KV 加载数据
             await $.initFromKV(env.SUB_STORE_DATA);
+            if (!$.read(SETTINGS_KEY)) $.write({}, SETTINGS_KEY);
             $.workerEnv = env;
 
             // 数据迁移
