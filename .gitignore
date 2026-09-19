@@ -5,3 +5,4 @@ pages-dist/_worker.js
 .dev.vars
 wrangler.toml
 踩坑笔记.md
+scratch/
