@@ -1,8 +1,10 @@
 node_modules/
 dist/
-pages-dist/_worker.js
+pages-dist/
 .wrangler/
 .dev.vars
 wrangler.toml
 踩坑笔记.md
 scratch/
+.tasks/
+NUL

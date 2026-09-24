@@ -5,6 +5,7 @@ import { version as substoreVersion } from '../../Sub-Store/backend/package.json
 const version = `${substoreVersion}(w${workersVersion})`;
 import $ from '@/core/app';
 import express from '@/vendor/express';
+import * as xCache from '@/vendor/x-cache';
 import migrate from '@/utils/migration';
 
 import registerSubscriptionRoutes from '@/restful/subscriptions';
@@ -54,17 +55,33 @@ registerLogRoutes($app);
 registerAgeRoutes($app);
 
 export default {
-    // 定时同步
+    // 定时同步（预热探测并轨：先探测，再跑原有同步逻辑）
     async scheduled(event, env, ctx) {
         const kvError = validateKVBinding(env);
         if (kvError) {
             console.error(`[Cron] ${kvError.message}`);
             return;
         }
-        ctx.waitUntil(cronSyncArtifacts(env));
+
+        // [x-cache] 预热并轨到现有唯一 cron（"55 15 * * *"，不占额外 cron 配额）：
+        // 预热探测先跑（读预热清单、逐 URL 只判状态码，≤9 次子请求、I/O 不占 CPU），
+        // 结算后再跑原有 cronSyncArtifacts（逻辑一行未改）。
+        // 若 event.cron 命中预热专用 pattern（未来释放配额后追加 cron），则只做预热、不做同步。
+        ctx.waitUntil(
+            xCache.runScheduledTasks({
+                    cron: event?.cron,
+                    kv: env.SUB_STORE_DATA,
+                    runSync: () => cronSyncArtifacts(env),
+                })
+                .catch((e) => console.error(`[Cron] 任务异常: ${e?.message ?? e}`)),
+        );
     },
 
     async fetch(request, env, ctx) {
+        // [x-cache] 标签前置：标签在「读阶段结束」第一时间定值并在响应对象生成后立刻写入，
+        // 后续写缓存/回写 KV/任何异常都不再吞掉 X-Cache 观测头（批次03 修复）
+        let isDownloadRequest = false;
+        let cacheLabel = '';
         try {
             const kvError = validateKVBinding(env);
             if (kvError) return kvError.response;
@@ -126,6 +143,25 @@ export default {
                 }
             }
 
+            // [x-cache] 落点A：/download 缓存层读路径 —— Cache API → KV → 未命中放行
+            // 命中直接返回，不加载 KV 数据、不进 express 分发（省 CPU，避免 1102）
+            isDownloadRequest = xCache.isDownloadPath(pathname, request.method);
+            const cacheBypass = isDownloadRequest && xCache.shouldBypassCacheRead(request.url);
+            // 读阶段结束即定标签：未命中（含 bypass）→ MISS；命中路径由 x-cache.js 重建响应时已带标签
+            isDownloadRequest && (cacheLabel = xCache.CACHE_LABEL.miss);
+            if (isDownloadRequest && !cacheBypass) {
+                const cached = await xCache.readCachedDownload({
+                    cache: xCache.defaultCache(),
+                    kv: env.SUB_STORE_DATA,
+                    request,
+                });
+                if (cached) {
+                    console.log(`[x-cache] ${cached.headers.get('X-Cache')} ${pathname}`);
+                    // 兜底：命中响应若因任何原因缺标签，这里补上（保证 HIT 路径也不漏头）
+                    return xCache.applyCacheLabel(cached, cached.headers.get('X-Cache') || xCache.CACHE_LABEL.hit);
+                }
+            }
+
             // 注入环境变量
             globalThis.__workerEnv = env;
 
@@ -183,6 +219,52 @@ export default {
             // 路由分发
             const response = await $app.handleRequest(request);
 
+            // [x-cache] 落点A续：标签第一时间写入（先于写缓存调度，异常也不吞标签）
+            if (isDownloadRequest) {
+                xCache.applyCacheLabel(response, cacheLabel);
+                if (cacheBypass) console.log(`[x-cache] MISS(bypass) ${pathname}`);
+                // 未命中/被 bypass 的 /download 请求，异步写两层缓存 + 更新预热清单
+                try {
+                    ctx.waitUntil(
+                        xCache.storeDownload({
+                            cache: xCache.defaultCache(),
+                            kv: env.SUB_STORE_DATA,
+                            request,
+                            response: response.clone(),
+                            // refresh/nocache 拿到新内容时强制覆盖 KV，绕过 10min 写冷却（防旧内容回潮）
+                            bypassRead: cacheBypass,
+                        }),
+                    );
+                } catch (e) {
+                    console.error(`[x-cache] 写入调度失败: ${e?.message ?? e}`);
+                }
+            }
+
+            // [x-cache] 保存即作废：任何配置写接口（非 GET/HEAD/OPTIONS）成功返回（2xx）后，
+            // 清空全部 /download 下载缓存，避免用户改完订阅/节点组脚本配置后最长 6h 读到旧内容。
+            // 放在 storeDownload 调度之后；500 catch 路径天然不经过这里，不会误清。
+            try {
+                const isConfigMutation =
+                    !['GET', 'HEAD', 'OPTIONS'].includes(request.method) &&
+                    response.status >= 200 &&
+                    response.status < 300;
+                if (isConfigMutation) {
+                    ctx.waitUntil(
+                        xCache.invalidateAllDownloads({
+                            cache: xCache.defaultCache(),
+                            kv: env.SUB_STORE_DATA,
+                        })
+                            .then((r) =>
+                                console.log(`[x-cache] 配置变更(非 GET 2xx)，清空下载缓存完成: cleared=${r?.cleared ?? 0} failed=${r?.failed ?? 0}`),
+                            )
+                            .catch((e) => console.error(`[x-cache] 清空下载缓存失败: ${e?.message ?? e}`)),
+                    );
+                    console.log('[x-cache] 配置变更(非 GET 2xx)，已调度清空下载缓存');
+                }
+            } catch (e) {
+                console.error(`[x-cache] 失效调度失败: ${e?.message ?? e}`);
+            }
+
             // 禁止 Cloudflare CDN/边缘节点缓存动态 API 响应
             // 未设置此头时，不同 URL 路径（如 /share/ 和 /download/）的响应可能被独立缓存，
             // 导致同一订阅在不同接口返回不一致（陈旧）的数据
@@ -209,18 +291,21 @@ export default {
                 ...($.pendingPushes || []),
             ]));
             $.pendingPushes = [];
-            return new Response(
-                JSON.stringify({
-                    status: 'failed',
-                    message: 'Internal Server Error',
-                }),
-                {
-                    status: 500,
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Access-Control-Allow-Origin': '*',
+            return xCache.applyCacheLabel(
+                new Response(
+                    JSON.stringify({
+                        status: 'failed',
+                        message: 'Internal Server Error',
+                    }),
+                    {
+                        status: 500,
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Access-Control-Allow-Origin': '*',
+                        },
                     },
-                },
+                ),
+                cacheLabel,
             );
         }
     },
