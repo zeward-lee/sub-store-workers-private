@@ -27,6 +27,7 @@
 
 import quickjsWasmModule from './quickjs.wasm';
 import YAML from '@/utils/yaml';
+import { createDeadlineGuard, SCRIPT_TIMEOUT_MS, isDeadlineExceeded, formatScriptError } from './quickjs-timeout';
 
 // 使用全局作用域缓存，避免跨请求重复编译 WASM
 if (typeof globalThis.__quickjsModule === 'undefined') {
@@ -37,6 +38,11 @@ if (typeof globalThis.__quickjsRuntime === 'undefined') {
 }
 if (typeof globalThis.__quickjsContext === 'undefined') {
     globalThis.__quickjsContext = null;
+}
+// 时间预算中断器（deadline guard）：cleanup() 会 disarm 并置 null，
+// 避免 cleanup/重建竞态下在途调用沿用旧 guard（预算静默失效或残留误杀）
+if (typeof globalThis.__quickjsDeadlineGuard === 'undefined') {
+    globalThis.__quickjsDeadlineGuard = null;
 }
 
 /**
@@ -96,22 +102,20 @@ async function initQuickJS() {
     const runtime = QuickJS.newRuntime();
     runtime.setMemoryLimit(1024 * 1024 * 16); // 16MB 内存限制
     runtime.setMaxStackSize(1024 * 1024);     // 1MB 栈限制
-    // 每 5000 条指令中断检查，防止死循环
-    var __interruptCounter = 0;
-    runtime.setInterruptHandler(function () {
-        __interruptCounter++;
-        if (__interruptCounter >= 5000) {
-            __interruptCounter = 0;
-            return true;
-        }
-        return false;
-    });
+    // 时间预算式中断器（deadline）：单次脚本执行超过 SCRIPT_TIMEOUT_MS 即中断。
+    // 相比旧的指令计数方案（每 5000 条指令中断一次）：
+    //   1) 无跨脚本计数残留——arm() 每次重设 deadline，disarm() 恢复永不超时；
+    //   2) 慢脚本真正拦得住——按 wall-clock 判定，而非每 5000 条指令才看一眼。
+    // interruptHandler 只在沙箱 JS 执行期间被调，宿主 await 期间不计时，天然公平。
+    var guard = createDeadlineGuard();
+    runtime.setInterruptHandler(guard.handler);
 
     const context = runtime.newContext();
 
     globalThis.__quickjsModule = QuickJS;
     globalThis.__quickjsRuntime = runtime;
     globalThis.__quickjsContext = context;
+    globalThis.__quickjsDeadlineGuard = guard;
 
     return { context, runtime, QuickJS };
 }
@@ -199,12 +203,29 @@ async function executeInSandbox(script, name, api) {
         // 用 IIFE 包裹：先执行 script（定义函数），再返回名为 name 的函数。
         // 注意：用户脚本可能含注释行和多种声明，func 模式失败后会自动回退 nodeFunc。
         var wrappedScript = '(function(){\n' + script + '\nreturn ' + name + ';\n})()';
-        var evalResult = context.evalCode(wrappedScript);
+
+        // 时间预算：evalCode 前 arm，成功/抛错（finally）都 disarm，防残留 deadline 误杀下个脚本。
+        // 超时判定快照必须在 disarm 之前取（disarm 后 deadline=Infinity，恒判未超时）。
+        // guard 缺失只告警不抛错：超时保护是增强能力，不是执行的硬依赖。
+        var guard = globalThis.__quickjsDeadlineGuard;
+        if (guard) {
+            guard.arm();
+        } else {
+            console.warn('[quickjs] deadline guard 缺失,超时保护未生效');
+        }
+        var evalResult;
+        var evalTimedOut = false;
+        try {
+            evalResult = context.evalCode(wrappedScript);
+        } finally {
+            evalTimedOut = isDeadlineExceeded(guard);
+            if (guard) guard.disarm();
+        }
 
         if (evalResult.error) {
             var errMsg = getErrorMessage(context, evalResult.error);
             evalResult.error.dispose();
-            throw new Error('Script evaluation failed: ' + errMsg);
+            throw new Error(formatScriptError('Script evaluation failed', errMsg, evalTimedOut, SCRIPT_TIMEOUT_MS));
         }
 
         var fnHandle = evalResult.value;
@@ -231,6 +252,13 @@ async function executeInSandbox(script, name, api) {
  * 清理所有 QuickJS 资源（Durable Object 销毁时调用）
  */
 function cleanup() {
+    // 先 disarm 并置 null guard：cleanup/重建竞态下在途调用不得沿用旧 guard
+    // （否则预算静默失效，或残留 deadline 误杀重建后的下个脚本）
+    var guard = globalThis.__quickjsDeadlineGuard;
+    if (guard) {
+        try { guard.disarm(); } catch (e) { /* ignore */ }
+        globalThis.__quickjsDeadlineGuard = null;
+    }
     var ctx = globalThis.__quickjsContext;
     if (ctx) {
         try { ctx.dispose(); } catch (e) { /* ignore */ }
@@ -256,49 +284,75 @@ function cleanup() {
  * @returns {*} 宿主环境结果
  */
 async function callSandboxFunction(context, runtime, fnHandle, callArgs) {
-    var callResult = context.callFunction(fnHandle, context.null, callArgs);
-
-    // 释放输入参数
-    for (var k = 0; k < callArgs.length; k++) {
-        if (callArgs[k] !== context.null) {
-            try { callArgs[k].dispose(); } catch (e) { /* ignore */ }
-        }
-    }
-
-    if (callResult.error) {
-        var callErrMsg = getErrorMessage(context, callResult.error);
-        callResult.error.dispose();
-        throw new Error('Script execution failed: ' + callErrMsg);
-    }
-
-    // async function 会返回 Promise，需要跑完 QuickJS 的 pending jobs
-    var finalValue = callResult.value;
-    if (context.typeof(finalValue) === 'object') {
-        var resolvedPromise = context.resolvePromise(finalValue);
-        runtime.executePendingJobs();
-        var resolvedResult = await resolvedPromise;
-        if (resolvedResult.error) {
-            var asyncErrMsg = getErrorMessage(context, resolvedResult.error);
-            resolvedResult.error.dispose();
-            finalValue.dispose();
-            throw new Error('Script async execution failed: ' + asyncErrMsg);
-        }
-        finalValue.dispose();
-        finalValue = resolvedResult.value;
-    }
-
-    // 将结果序列化回 host 环境
-    var resultStr = context.dump(finalValue);
-    finalValue.dispose();
-
-    if (resultStr === undefined || resultStr === 'undefined') {
-        return undefined;
+    // 时间预算：callFunction + pending jobs pump 整段计入同一个预算窗口；
+    // 所有 return/throw 路径（finally）都会 disarm，防残留 deadline 误杀下个脚本。
+    // guard 缺失只告警不抛错：超时保护是增强能力，不是执行的硬依赖。
+    var guard = globalThis.__quickjsDeadlineGuard;
+    if (guard) {
+        guard.arm();
+    } else {
+        console.warn('[quickjs] deadline guard 缺失,超时保护未生效');
     }
 
     try {
-        return JSON.parse(resultStr);
-    } catch (e) {
-        return resultStr;
+        var callResult = context.callFunction(fnHandle, context.null, callArgs);
+
+        // 释放输入参数
+        for (var k = 0; k < callArgs.length; k++) {
+            if (callArgs[k] !== context.null) {
+                try { callArgs[k].dispose(); } catch (e) { /* ignore */ }
+            }
+        }
+
+        if (callResult.error) {
+            var callErrMsg = getErrorMessage(context, callResult.error);
+            callResult.error.dispose();
+            throw new Error(formatScriptError('Script execution failed', callErrMsg, isDeadlineExceeded(guard), SCRIPT_TIMEOUT_MS));
+        }
+
+        // async function 会返回 Promise，需要跑完 QuickJS 的 pending jobs
+        var finalValue = callResult.value;
+        if (context.typeof(finalValue) === 'object') {
+            var resolvedPromise = context.resolvePromise(finalValue);
+            // executePendingJobs 在 job 抛错（含中断）时也会返回 { error }，不能忽略
+            var pendingJobsResult = runtime.executePendingJobs();
+            if (pendingJobsResult && pendingJobsResult.error) {
+                var pendingErrMsg = getErrorMessage(context, pendingJobsResult.error);
+                pendingJobsResult.error.dispose();
+                finalValue.dispose();
+                throw new Error(formatScriptError('Script pending jobs failed', pendingErrMsg, isDeadlineExceeded(guard), SCRIPT_TIMEOUT_MS));
+            }
+            // await 之前先解除预算：此后已无沙箱执行（promise 状态已在 executePendingJobs 中定格），
+            // 继续挂着旧 deadline 会形成「过期窗口借走」——在途判定可能被残留 deadline 污染。
+            // 超时判定用 disarm 前的快照（disarm 后 deadline=Infinity，恒判未超时）。
+            var asyncTimedOut = isDeadlineExceeded(guard);
+            if (guard) guard.disarm();
+            var resolvedResult = await resolvedPromise;
+            if (resolvedResult.error) {
+                var asyncErrMsg = getErrorMessage(context, resolvedResult.error);
+                resolvedResult.error.dispose();
+                finalValue.dispose();
+                throw new Error(formatScriptError('Script async execution failed', asyncErrMsg, asyncTimedOut, SCRIPT_TIMEOUT_MS));
+            }
+            finalValue.dispose();
+            finalValue = resolvedResult.value;
+        }
+
+        // 将结果序列化回 host 环境
+        var resultStr = context.dump(finalValue);
+        finalValue.dispose();
+
+        if (resultStr === undefined || resultStr === 'undefined') {
+            return undefined;
+        }
+
+        try {
+            return JSON.parse(resultStr);
+        } catch (e) {
+            return resultStr;
+        }
+    } finally {
+        if (guard) guard.disarm();
     }
 }
 
