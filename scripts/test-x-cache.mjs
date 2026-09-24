@@ -16,6 +16,9 @@
  *  - 缓存索引 upsertCacheIndex（新键/去重置顶/队首跳写/超限截断+告警）
  *  - invalidateAllDownloads（正常清理+索引键删除/失败条目写回/分批并发/空索引清预热清单兜底/容错）
  *  - storeDownload bypassRead 语义（冷却窗口跳写 vs 强制覆盖）+ index.js 失效接线
+ *  - cacheRequestKey 键哈希化（SHA-256/xcache.invalid/明文凭据不进键）+ 三处 Cache API 读写删贯穿
+ *  - stale-on-error（KV 年龄分层 6h 新鲜窗口+未来时间戳防护 / readStaleFromKv 兜底+24h age 双保险
+ *    +STALE 标签+ACAO+FakeKV TTL 过期模拟 / index.js 接线+早退补冲刷）
  *  - 源码接线检查（index.js 挂钩、wrangler.toml 单 cron）
  */
 
@@ -74,12 +77,26 @@ class FakeKV {
         this.map = new Map(Object.entries(init));
         this.puts = [];
         this.deletes = [];
+        this.now = null; // 可选：模拟当前时间(ms)。非 null 时 get 按 expiresAt 判过期；null = 不做 TTL 过期判定
     }
     async get(key) {
-        return this.map.has(key) ? this.map.get(key) : null;
+        if (!this.map.has(key)) return null;
+        const rec = this.map.get(key);
+        if (rec && typeof rec === 'object' && '__expiresAt' in rec) {
+            if (this.now !== null && this.now >= rec.__expiresAt) {
+                this.map.delete(key);
+                return null;
+            }
+            return rec.__value;
+        }
+        return rec;
     }
     async put(key, value, opts) {
-        this.map.set(key, value);
+        const rec =
+            opts && Number.isFinite(opts.expirationTtl)
+                ? { __value: value, __expiresAt: (this.now ?? Date.now()) + opts.expirationTtl * 1000 }
+                : value;
+        this.map.set(key, rec);
         this.puts.push({ key, value, opts });
     }
     async delete(key) {
@@ -261,8 +278,9 @@ await checkAsync('未命中（空 cache + 空 kv）→ null', async () => {
 await checkAsync('Cache API 命中 → X-Cache: CACHE-HIT，内容与头保留，Cache-Control 为 no-store', async () => {
     const cache = new FakeCache();
     const canonical = xc.normalizeCacheUrl(DL_URL);
+    const keyReq = await xc.cacheRequestKey(canonical);
     cache.map.set(
-        canonical,
+        keyReq.url,
         new Response(BODY, {
             status: 200,
             headers: { 'Content-Type': 'text/yaml', 'Content-Disposition': 'attachment; filename="airport-a.yaml"' },
@@ -275,6 +293,7 @@ await checkAsync('Cache API 命中 → X-Cache: CACHE-HIT，内容与头保留�
     eq(r.headers.get('Content-Disposition'), 'attachment; filename="airport-a.yaml"');
     eq(r.headers.get('Cache-Control'), 'no-store, no-cache, must-revalidate');
     eq(r.headers.get('CDN-Cache-Control'), 'no-store');
+    eq(r.headers.get('Access-Control-Allow-Origin'), '*', 'CACHE-HIT 与 KV-HIT/STALE 的 CORS 行为应一致');
     eq(await r.text(), BODY);
 });
 
@@ -297,6 +316,7 @@ await checkAsync('KV 命中 → X-Cache: KV-HIT，重建 body + 补 Content-Disp
     eq(r.headers.get('X-Cache'), 'KV-HIT');
     eq(r.headers.get('Content-Disposition'), 'attachment; filename="airport-a.yaml"');
     eq(r.headers.get('Cache-Control'), 'no-store, no-cache, must-revalidate');
+    eq(r.headers.get('Access-Control-Allow-Origin'), '*');
     eq(await r.text(), BODY);
 });
 
@@ -304,7 +324,7 @@ await checkAsync('Cache API 优先于 KV', async () => {
     const cache = new FakeCache();
     const kv = new FakeKV();
     const canonical = xc.normalizeCacheUrl(DL_URL);
-    cache.map.set(canonical, new Response('from-cache', { status: 200 }));
+    cache.map.set((await xc.cacheRequestKey(canonical)).url, new Response('from-cache', { status: 200 }));
     await kv.put(await xc.kvKey(canonical), JSON.stringify({ body: 'from-kv', storedAt: new Date().toISOString() }));
     const r = await xc.readCachedDownload({ cache, kv, request: new Request(DL_URL) });
     eq(r.headers.get('X-Cache'), 'CACHE-HIT');
@@ -352,7 +372,7 @@ await checkAsync('cache 抛错 → 回落 KV，不抛错', async () => {
 // ---------------------------------------------------------------------------
 console.log('\n[6] storeDownload');
 
-await checkAsync('合法响应 → 写 Cache API + KV(TTL 21600) + 预热清单', async () => {
+await checkAsync('合法响应 → 写 Cache API(哈希键) + KV(TTL 86400) + 预热清单', async () => {
     const cache = new FakeCache();
     const kv = new FakeKV();
     const resp = new Response(BODY, {
@@ -365,8 +385,11 @@ await checkAsync('合法响应 → 写 Cache API + KV(TTL 21600) + 预热清单'
     eq(r.kv, true);
 
     const canonical = xc.normalizeCacheUrl(DL_URL);
-    eq(cache.puts, [canonical]);
-    const cachedResp = cache.map.get(canonical);
+    const cacheKeyUrl = (await xc.cacheRequestKey(canonical)).url;
+    eq(cache.puts, [cacheKeyUrl]);
+    ok(cacheKeyUrl.startsWith('https://xcache.invalid/'), `Cache API 键应为哈希形态: ${cacheKeyUrl}`);
+    ok(!cacheKeyUrl.includes('secret'), 'Cache API 键不应含明文 token');
+    const cachedResp = cache.map.get(cacheKeyUrl);
     eq(cachedResp.headers.get('Cache-Control'), `public, max-age=${xc.CACHE_TTL_SECONDS}`);
 
     const key = await xc.kvKey(canonical);
@@ -932,7 +955,9 @@ await checkAsync('正常清理：逐条删 Cache API + KV，收尾删索引键�
     eq(r, { cleared: 2, failed: 0 });
 
     const canon = urls.map((u) => xc.normalizeCacheUrl(u));
-    eq(cache.deletes.sort(), [...canon].sort(), '每条 URL 的 Cache API 都应被删除');
+    const cacheKeyUrls = [];
+    for (const c of canon) cacheKeyUrls.push((await xc.cacheRequestKey(c)).url);
+    eq(cache.deletes.sort(), cacheKeyUrls.sort(), '每条 URL 的 Cache API（哈希键）都应被删除');
 
     const keys = [];
     for (const c of canon) keys.push(await xc.kvKey(c));
@@ -958,14 +983,15 @@ await checkAsync('单条 cache.delete 抛错 → 继续清其余，失败条目�
     const kv = new FakeKV();
     await seedIndex(kv, ['https://h/download/a', 'https://h/download/b']);
     const cache = new FakeCache();
+    const failUrl = (await xc.cacheRequestKey('https://h/download/a')).url;
     const origDelete = cache.delete.bind(cache);
     cache.delete = async (req) => {
-        if (req.url === 'https://h/download/a') throw new Error('delete boom');
+        if (req.url === failUrl) throw new Error('delete boom');
         return origDelete(req);
     };
     const r = await xc.invalidateAllDownloads({ cache, kv });
     eq(r, { cleared: 1, failed: 1 });
-    ok(cache.deletes.includes('https://h/download/b'), '其余条目仍应被清理');
+    ok(cache.deletes.includes((await xc.cacheRequestKey('https://h/download/b')).url), '其余条目仍应被清理（哈希键）');
     eq(kv.deletes.length, 2, '两条 URL 的 KV 删除与 Cache 删除互不影响，都应执行（失败路径收尾走 put，无索引键删除）');
 
     // P1 收尾：有失败 → 失败条目写回索引（带 TTL），留给下次保存即作废重试
@@ -1012,7 +1038,11 @@ await checkAsync('索引为空 → 兜底清预热清单里的 URL', async () =>
     await xc.upsertPreheatList(kv, 'https://h/download/p2');
     const r = await xc.invalidateAllDownloads({ cache, kv });
     eq(r, { cleared: 2, failed: 0 });
-    eq(cache.deletes.sort(), ['https://h/download/p1', 'https://h/download/p2'], '预热清单 URL 应被兜底删除');
+    const pKeys = [
+        (await xc.cacheRequestKey('https://h/download/p1')).url,
+        (await xc.cacheRequestKey('https://h/download/p2')).url,
+    ];
+    eq(cache.deletes.sort(), pKeys.sort(), '预热清单 URL 应被兜底删除（哈希键）');
     const keys = [await xc.kvKey('https://h/download/p1'), await xc.kvKey('https://h/download/p2')];
     eq(kv.deletes.sort(), [...keys, xc.CACHE_INDEX_KEY].sort(), '预热清单 KV 键 + 收尾索引键都应被删除');
 });
@@ -1097,6 +1127,252 @@ check('index.js 接线：配置写成功调度失效 + storeDownload 传 bypassR
     const iStore = src.indexOf('xCache.storeDownload(');
     const iInvalidate = src.indexOf('xCache.invalidateAllDownloads(');
     ok(iInvalidate > iStore, '失效触发应放在写缓存调度之后');
+});
+
+// ---------------------------------------------------------------------------
+// 15. cacheRequestKey（Cache API 键哈希化）
+// ---------------------------------------------------------------------------
+console.log('\n[15] cacheRequestKey');
+
+await checkAsync('返回 GET Request，url 形如 https://xcache.invalid/<64hex>', async () => {
+    const req = await xc.cacheRequestKey('https://h/download/a?token=x');
+    ok(req instanceof Request, '应返回 Request 实例');
+    eq(req.method, 'GET');
+    ok(/^https:\/\/xcache\.invalid\/[0-9a-f]{64}$/.test(req.url), `url 形态不符: ${req.url}`);
+});
+
+await checkAsync('SHA-256 已知向量（sha256("abc")）', async () => {
+    const req = await xc.cacheRequestKey('abc');
+    eq(req.url, 'https://xcache.invalid/ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+});
+
+await checkAsync('同 URL 同键、不同 URL 不同键', async () => {
+    const a1 = (await xc.cacheRequestKey('https://h/download/a?token=x')).url;
+    const a2 = (await xc.cacheRequestKey('https://h/download/a?token=x')).url;
+    const b = (await xc.cacheRequestKey('https://h/download/b?token=x')).url;
+    eq(a1, a2, '同 URL 应产生同键');
+    ok(a1 !== b, '不同 URL 应产生不同键');
+});
+
+await checkAsync('明文凭据不进键（token 值不出现在 url）', async () => {
+    const req = await xc.cacheRequestKey(DL_URL);
+    ok(!req.url.includes('secret'), '键中不得出现明文 token 值');
+    ok(!req.url.includes('token='), '键中不得出现明文参数段');
+});
+
+// ---------------------------------------------------------------------------
+// 16. 三处 Cache API 读写删全部走哈希键（明文 URL 不出现在 fake cache 收到的键里）
+// ---------------------------------------------------------------------------
+console.log('\n[16] Cache API 键哈希化贯穿');
+
+await checkAsync('storeDownload 写入的是哈希键（不含明文 URL/token）', async () => {
+    const cache = new FakeCache();
+    const r = await xc.storeDownload({ cache, kv: new FakeKV(), request: new Request(DL_URL), response: mkYamlResp() });
+    eq(r.cache, true);
+    eq(cache.puts.length, 1);
+    ok(/^https:\/\/xcache\.invalid\/[0-9a-f]{64}$/.test(cache.puts[0]), `应为哈希键: ${cache.puts[0]}`);
+    ok(!cache.puts[0].includes('secret'), '键不得含明文 token');
+    ok(!cache.puts[0].includes('download'), '键不得含明文 URL 片段');
+});
+
+await checkAsync('readCachedDownload 用哈希键匹配（明文 URL 键下无条目仍命中）', async () => {
+    const cache = new FakeCache();
+    const seen = [];
+    const origMatch = cache.match.bind(cache);
+    cache.match = async (req) => {
+        seen.push(req.url);
+        return origMatch(req);
+    };
+    const canonical = xc.normalizeCacheUrl(DL_URL);
+    cache.map.set((await xc.cacheRequestKey(canonical)).url, new Response(BODY, { status: 200 }));
+    const r = await xc.readCachedDownload({ cache, kv: new FakeKV(), request: new Request(DL_URL) });
+    eq(r?.headers.get('X-Cache'), 'CACHE-HIT');
+    eq(seen.length, 1);
+    ok(/^https:\/\/xcache\.invalid\//.test(seen[0]), `match 应发哈希键: ${seen[0]}`);
+    ok(!seen[0].includes('secret'), 'match 键不得含明文 token');
+    ok(!cache.map.has(canonical), '明文 URL 键下不应有条目');
+});
+
+await checkAsync('invalidateAllDownloads 删除的是哈希键', async () => {
+    const cache = new FakeCache();
+    const kv = new FakeKV();
+    await seedIndex(kv, ['https://h/download/a?token=x']);
+    const r = await xc.invalidateAllDownloads({ cache, kv });
+    eq(r, { cleared: 1, failed: 0 });
+    eq(cache.deletes.length, 1);
+    ok(/^https:\/\/xcache\.invalid\/[0-9a-f]{64}$/.test(cache.deletes[0]), `应为哈希键: ${cache.deletes[0]}`);
+    ok(!cache.deletes[0].includes('secret'), '删除键不得含明文 token');
+});
+
+// ---------------------------------------------------------------------------
+// 17. stale-on-error（KV 年龄分层 + readStaleFromKv 兜底）
+// ---------------------------------------------------------------------------
+console.log('\n[17] stale-on-error');
+
+check('常量钉值：STALE 标签 / KV_TTL 86400 / 新鲜窗口 21600 / 预热清单 TTL 保持 21600', () => {
+    eq(xc.CACHE_LABEL.stale, 'STALE');
+    eq(xc.KV_TTL_SECONDS, 86400);
+    eq(xc.KV_FRESH_WINDOW_SECONDS, 21600);
+    eq(xc.PREHEAT_LIST_TTL_SECONDS, 21600);
+});
+
+check('applyCacheLabel 接受 STALE（CACHE_LABEL_VALUES 由 Object.values 生成，自动收录）', () => {
+    const resp = new Response('b', { status: 200 });
+    eq(xc.applyCacheLabel(resp, xc.CACHE_LABEL.stale).headers.get('X-Cache'), 'STALE');
+});
+
+async function seedStaleKv(ageMs, body = BODY) {
+    const kv = new FakeKV();
+    const canonical = xc.normalizeCacheUrl(DL_URL);
+    await kv.put(
+        await xc.kvKey(canonical),
+        JSON.stringify({
+            body,
+            contentType: 'text/yaml',
+            contentDisposition: 'attachment; filename="a.yaml"',
+            storedAt: new Date(Date.now() - ageMs).toISOString(),
+        }),
+        { expirationTtl: xc.KV_TTL_SECONDS },
+    );
+    return kv;
+}
+
+const SIX_H_MS = xc.KV_FRESH_WINDOW_SECONDS * 1000;
+
+await checkAsync('KV 条目 5h59m 龄 → readCachedDownload 正常命中 KV-HIT', async () => {
+    const kv = await seedStaleKv(SIX_H_MS - 60 * 1000);
+    const r = await xc.readCachedDownload({ cache: null, kv, request: new Request(DL_URL) });
+    eq(r?.headers.get('X-Cache'), 'KV-HIT');
+});
+
+await checkAsync('KV 条目恰好 6h 龄（>= 阈值）→ 不作为正常命中', async () => {
+    const kv = await seedStaleKv(SIX_H_MS);
+    eq(await xc.readCachedDownload({ cache: null, kv, request: new Request(DL_URL) }), null);
+});
+
+await checkAsync('KV 条目 7h 龄 → readCachedDownload 不命中（走原路径重新拉取）', async () => {
+    const kv = await seedStaleKv(7 * 3600 * 1000);
+    eq(await xc.readCachedDownload({ cache: null, kv, request: new Request(DL_URL) }), null);
+});
+
+await checkAsync('上游 500 场景：readStaleFromKv 对 7h 龄条目命中，回吐 X-Cache: STALE + 200 + 头重建', async () => {
+    const kv = await seedStaleKv(7 * 3600 * 1000);
+    const r = await xc.readStaleFromKv({ kv, request: new Request(DL_URL) });
+    ok(r !== null, '应命中 stale');
+    eq(r.status, 200);
+    eq(r.headers.get('X-Cache'), 'STALE');
+    eq(r.headers.get('Content-Type'), 'text/yaml');
+    eq(r.headers.get('Content-Disposition'), 'attachment; filename="a.yaml"');
+    eq(r.headers.get('Cache-Control'), 'no-store, no-cache, must-revalidate');
+    eq(r.headers.get('CDN-Cache-Control'), 'no-store');
+    eq(r.headers.get('Access-Control-Allow-Origin'), '*', 'STALE 替换失败响应后不应丢 CORS 头');
+    eq(await r.text(), BODY);
+});
+
+await checkAsync('refresh(bypass) 失败场景同样命中：readStaleFromKv 不区分 bypass 参数', async () => {
+    const kv = await seedStaleKv(7 * 3600 * 1000);
+    const r = await xc.readStaleFromKv({ kv, request: new Request(`${DL_URL}&refresh=1`) });
+    eq(r?.headers.get('X-Cache'), 'STALE');
+});
+
+await checkAsync('KV 无条目 / body 非字符串 / kv 不可用 / kv.get 抛错 / URL 非法 → 一律 null 不抛', async () => {
+    eq(await xc.readStaleFromKv({ kv: new FakeKV(), request: new Request(DL_URL) }), null);
+    const bad = new FakeKV();
+    await bad.put(await xc.kvKey(xc.normalizeCacheUrl(DL_URL)), JSON.stringify({ contentType: 'text/yaml' }));
+    eq(await xc.readStaleFromKv({ kv: bad, request: new Request(DL_URL) }), null);
+    eq(await xc.readStaleFromKv({ kv: null, request: new Request(DL_URL) }), null);
+    eq(await xc.readStaleFromKv({ kv: {}, request: new Request(DL_URL) }), null);
+    const broken = {
+        get: async () => {
+            throw new Error('kv down');
+        },
+    };
+    eq(await xc.readStaleFromKv({ kv: broken, request: new Request(DL_URL) }), null);
+    eq(await xc.readStaleFromKv({ kv: new FakeKV(), request: { url: 'not-a-url' } }), null);
+});
+
+await checkAsync('KV 条目 storedAt 在未来 → readCachedDownload 不命中（未来时间戳防护，对齐 isFreshEntry）', async () => {
+    const kv = await seedStaleKv(-5 * 60 * 1000); // 未来 5 分钟
+    eq(await xc.readCachedDownload({ cache: null, kv, request: new Request(DL_URL) }), null);
+});
+
+await checkAsync('23h59m 龄 STALE 命中，且命中日志可见 age 小时数', async () => {
+    const kv = await seedStaleKv(23 * 3600 * 1000 + 59 * 60 * 1000);
+    const logs = [];
+    const origLog = console.log;
+    console.log = (...a) => logs.push(a.map(String).join(' '));
+    let r;
+    try {
+        r = await xc.readStaleFromKv({ kv, request: new Request(DL_URL) });
+    } finally {
+        console.log = origLog;
+    }
+    eq(r?.headers.get('X-Cache'), 'STALE');
+    ok(logs.some((l) => l.includes('age=') && l.includes('h)')), `STALE 命中日志应含 age 小时数: ${JSON.stringify(logs)}`);
+});
+
+await checkAsync('双保险：KV 未过期但 storedAt 超过 KV_TTL(24h) → readStaleFromKv 返回 null', async () => {
+    const kv = await seedStaleKv(25 * 3600 * 1000);
+    eq(await xc.readStaleFromKv({ kv, request: new Request(DL_URL) }), null);
+});
+
+await checkAsync('双保险：storedAt 在未来（时钟偏移）→ readStaleFromKv 返回 null', async () => {
+    const kv = await seedStaleKv(-60 * 1000);
+    eq(await xc.readStaleFromKv({ kv, request: new Request(DL_URL) }), null);
+});
+
+await checkAsync('FakeKV TTL 过期模拟：到期后 get 返回 null，readStaleFromKv 同步为 null', async () => {
+    const kv = new FakeKV();
+    kv.now = Date.now();
+    const key = await xc.kvKey(xc.normalizeCacheUrl(DL_URL));
+    await kv.put(key, JSON.stringify({ body: BODY, storedAt: new Date(kv.now).toISOString() }), { expirationTtl: 3600 });
+    ok((await kv.get(key)) !== null, '未过期应可读');
+    kv.now += 3601 * 1000;
+    eq(await kv.get(key), null, '到期后 get 应返回 null（模拟 KV TTL 过期）');
+    eq(await xc.readStaleFromKv({ kv, request: new Request(DL_URL) }), null);
+});
+
+await checkAsync('STALE 命中路径不回写缓存、不延长 TTL', async () => {
+    const kv = await seedStaleKv(7 * 3600 * 1000);
+    const key = await xc.kvKey(xc.normalizeCacheUrl(DL_URL));
+    const putsBefore = kv.puts.length;
+    const r = await xc.readStaleFromKv({ kv, request: new Request(DL_URL) });
+    ok(r !== null, '应命中');
+    eq(kv.puts.length, putsBefore, 'STALE 命中不应产生任何 KV 写');
+    kv.now = Date.now();
+    kv.now += (xc.KV_TTL_SECONDS - 1) * 1000;
+    ok((await kv.get(key)) !== null, '原 TTL 窗口内仍应可读');
+    kv.now += 2 * 1000;
+    eq(await kv.get(key), null, 'TTL 未被延长：按原到期时间正常过期');
+});
+
+// ---------------------------------------------------------------------------
+// 18. index.js stale-on-error 接线检查
+// ---------------------------------------------------------------------------
+console.log('\n[18] index.js stale 接线');
+
+check('index.js stale 接线（存在性检查）：status>=400 / 回吐日志 / try/catch / 早退补冲刷', () => {
+    const src = fs.readFileSync(path.join(ROOT, 'src/index.js'), 'utf8');
+    ok(src.includes('xCache.readStaleFromKv('), '缺少 stale 兜底调用');
+    ok(src.includes('response.status >= 400'), '缺少 status>=400 触发条件');
+    ok(src.includes('回吐 STALE 缓存'), '缺少 stale 回吐日志');
+    const iStale = src.indexOf('xCache.readStaleFromKv(');
+    const iStore = src.indexOf('xCache.storeDownload(');
+    ok(iStale > 0 && iStore > iStale, 'stale 兜底应存在且在写缓存调度之前（失败响应不进写入流程）');
+    const block = src.slice(iStale, iStore);
+    ok(block.includes('} catch'), 'stale 兜底应整体 try/catch（异常回落原失败响应）');
+    ok(
+        block.includes('$.persistCache()') && block.includes('$.pendingPushes = []'),
+        'STALE 早退前应补例行冲刷（不丢 KV 回写与 pendingPushes）',
+    );
+});
+
+check('x-cache.js 含 STALE 标签 / readStaleFromKv / cacheRequestKey', () => {
+    const x = fs.readFileSync(path.join(ROOT, 'src/vendor/x-cache.js'), 'utf8');
+    ok(x.includes("stale: 'STALE'"), 'CACHE_LABEL 缺 stale');
+    ok(x.includes('readStaleFromKv'), '缺 readStaleFromKv');
+    ok(x.includes('cacheRequestKey'), '缺 cacheRequestKey');
+    ok(x.includes('KV_FRESH_WINDOW_SECONDS'), '缺新鲜窗口常量');
 });
 
 // ---------------------------------------------------------------------------

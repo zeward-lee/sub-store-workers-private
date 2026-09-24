@@ -221,6 +221,38 @@ export default {
 
             // [x-cache] 落点A续：标签第一时间写入（先于写缓存调度，异常也不吞标签）
             if (isDownloadRequest) {
+                // [x-cache] stale-on-error：上游失败(status>=400)时优先回吐 KV 里的旧内容兜底
+                // （含 refresh/nocache bypass——断粮场景 refresh 恰恰最需要兜底）。
+                // 命中则直接返回 STALE 响应替代失败响应（此路径不写缓存、不进 storeDownload）；
+                // 未命中/兜底异常时继续走原失败响应路径。必须放在 storeDownload 调度之前：
+                // 语义上失败响应不应进写入流程（validateCandidate 也会跳过非 200）。
+                if (response.status >= 400) {
+                    try {
+                        const stale = await xCache.readStaleFromKv({
+                            kv: env.SUB_STORE_DATA,
+                            request,
+                        });
+                        if (stale) {
+                            console.log(`[x-cache] 上游失败(status=${response.status}),回吐 STALE 缓存 ${pathname}`);
+                            // 早退前补同款例行冲刷：失败响应原本也会走到函数末尾的冲刷，
+                            // 早退替换响应不能丢掉本次请求积累的 KV 回写与 pendingPushes
+                            try {
+                                ctx.waitUntil(
+                                    Promise.all([
+                                        $.persistCache(),
+                                        ...($.pendingPushes || []),
+                                    ]).catch((e) => console.error(`[x-cache] STALE 早退冲刷失败: ${e?.message ?? e}`)),
+                                );
+                                $.pendingPushes = [];
+                            } catch (e) {
+                                console.error(`[x-cache] STALE 早退冲刷调度失败: ${e?.message ?? e}`);
+                            }
+                            return stale;
+                        }
+                    } catch (e) {
+                        console.error(`[x-cache] STALE 兜底异常: ${e?.message ?? e}`);
+                    }
+                }
                 xCache.applyCacheLabel(response, cacheLabel);
                 if (cacheBypass) console.log(`[x-cache] MISS(bypass) ${pathname}`);
                 // 未命中/被 bypass 的 /download 请求，异步写两层缓存 + 更新预热清单
@@ -241,7 +273,8 @@ export default {
             }
 
             // [x-cache] 保存即作废：任何配置写接口（非 GET/HEAD/OPTIONS）成功返回（2xx）后，
-            // 清空全部 /download 下载缓存，避免用户改完订阅/节点组脚本配置后最长 6h 读到旧内容。
+            // 清空全部 /download 下载缓存，避免用户改完订阅/节点组脚本配置后最长 24h（6-24h 段
+            // 仅 stale 兜底可读）读到旧内容。
             // 放在 storeDownload 调度之后；500 catch 路径天然不经过这里，不会误清。
             try {
                 const isConfigMutation =

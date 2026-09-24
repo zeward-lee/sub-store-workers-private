@@ -4,11 +4,13 @@
  * 职责：
  *  1. 缓存键规范化 normalizeCacheUrl —— 剥离易变 query 参数，防缓存碎片化
  *  2. 缓存候选校验 validateCandidate —— 只缓存 200 且体量达标的响应（坏结果不入缓存）
- *  3. Cache API（主缓存，TTL 30min）+ KV（兜底，TTL 6h）双写、KV 写前查重控配额
+ *  3. Cache API（主缓存，TTL 30min，键哈希化 cacheRequestKey）+ KV（兜底，TTL 24h：
+ *     0-6h 新鲜窗口正常命中 / 6-24h 仅作 stale 兜底池）双写、KV 写前查重控配额
  *  4. 自学习预热清单（KV 键 xcache:preheat-list，上限 10 条）与 cron 预热探测
  *  5. X-Cache 标签前置 applyCacheLabel —— 读阶段结束即定值，后续异常不吞观测头
  *  6. 「保存即作废」失效机制：配置写操作成功后按缓存索引（xcache:index）清空全部下载缓存
  *     （索引为空时兜底清预热清单；有删除失败的条目写回索引待下次重试）
+ *  7. stale-on-error 兜底 readStaleFromKv —— 上游失败(status>=400)时回吐 KV 旧内容（X-Cache: STALE）
  *
  * 设计约束（brief 已定）：
  *  - 本模块不 import 任何其它模块（保持可被 node 直接单测；也不引入循环依赖）
@@ -19,8 +21,14 @@
 
 /** Cache API 主缓存 TTL（秒） */
 export const CACHE_TTL_SECONDS = 1800;
-/** KV 兜底缓存 TTL（秒） */
-export const KV_TTL_SECONDS = 21600;
+/**
+ * KV 兜底缓存 TTL（秒，24h）。
+ * 0-6h 为正常新鲜窗口（readCachedDownload 正常命中）；6-24h 仅作 stale 兜底池
+ * （上游失败时由 readStaleFromKv 回吐旧内容，正常读取不再命中），到点由 KV 自动过期。
+ */
+export const KV_TTL_SECONDS = 86400;
+/** KV 正常新鲜窗口（秒，6h）：超过此龄的 KV 条目不再作为正常命中，只留给 stale 兜底 */
+export const KV_FRESH_WINDOW_SECONDS = 21600;
 /** KV 写冷却窗口：已存在且 storedAt 距今 < 10min 则跳过写入（控写配额） */
 export const KV_WRITE_THROTTLE_MS = 10 * 60 * 1000;
 /** 允许缓存的最小响应体字节数（严格大于） */
@@ -35,6 +43,8 @@ export const PREHEAT_TIMEOUT_MS = 30000;
 export const PREHEAT_LIST_LIMIT = 10;
 /** 预热清单 KV 键 */
 export const PREHEAT_LIST_KEY = 'xcache:preheat-list';
+/** 预热清单 TTL（秒，6h）：沿用原 KV_TTL 6h 语义（清单应随热度短衰减），不随下载缓存池 TTL(24h) 变化 */
+export const PREHEAT_LIST_TTL_SECONDS = 21600;
 /** 缓存索引 KV 键（记录已缓存的 /download 规范化 URL，供「保存即作废」批量清空） */
 export const CACHE_INDEX_KEY = 'xcache:index';
 /** 缓存索引上限 */
@@ -50,7 +60,7 @@ export const VOLATILE_PARAMS = ['refresh', 'nocache', 't', 'timestamp', 'nonce',
 /** 探测请求 UA（非密钥，便于线上辨识） */
 const PREHEAT_UA = 'sub-store-workers-xcache-preheat/1.0';
 
-/** X-Cache 观测头取值（对齐 requirements 枚举，不新增自定义值） */
+/** X-Cache 观测头取值（对齐 requirements 枚举） */
 export const CACHE_LABEL = {
     /** Cache API 命中 */
     hit: 'CACHE-HIT',
@@ -58,9 +68,11 @@ export const CACHE_LABEL = {
     kvHit: 'KV-HIT',
     /** 未命中（含 refresh/nocache bypass） */
     miss: 'MISS',
+    /** stale-on-error 兜底命中（上游失败时回吐的 KV 旧内容） */
+    stale: 'STALE',
 };
 
-/** 标签合法性：只允许枚举内的三个值（防止内部误传导致观测头污染） */
+/** 标签合法性：只允许枚举内的值（防止内部误传导致观测头污染） */
 const CACHE_LABEL_VALUES = Object.values(CACHE_LABEL);
 
 /** 缓存层返回给客户端的头（与原路径 :189-190 保持一致，避免行为漂移） */
@@ -112,6 +124,23 @@ export async function kvKey(canonicalUrl) {
     const digest = await subtle.digest('SHA-1', new TextEncoder().encode(String(canonicalUrl)));
     const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
     return `xcache:${hex}`;
+}
+
+/**
+ * Cache API 缓存键：`https://xcache.invalid/` + SHA-256 hex（小写）的 GET Request。
+ * 动机：canonicalUrl 含 ?token= 等明文凭据，直接作 Cache API 键会把明文写进缓存键；
+ * 哈希后明文凭据不离开进程。.invalid 是保留 TLD，该 Request 永远不会被真实发出。
+ * 兼容性：键形态变化使旧 Cache API 条目自然孤儿（30min TTL 自动淘汰），无需迁移；
+ * 索引（xcache:index）仍存 canonicalUrl，失效时按其重算哈希删除，逻辑闭环。
+ * @param {string} canonicalUrl normalizeCacheUrl 的产物
+ * @returns {Promise<Request>}
+ */
+export async function cacheRequestKey(canonicalUrl) {
+    const subtle = getSubtle();
+    if (!subtle) throw new Error('crypto.subtle unavailable');
+    const digest = await subtle.digest('SHA-256', new TextEncoder().encode(String(canonicalUrl)));
+    const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+    return new Request(`https://xcache.invalid/${hex}`, { method: 'GET' });
 }
 
 /**
@@ -226,7 +255,7 @@ export async function upsertPreheatList(kv, canonicalUrl, { now = Date.now() } =
         const list = await readPreheatList(kv);
         if (list[0] === canonicalUrl) return list;
         const next = [canonicalUrl, ...list.filter((item) => item !== canonicalUrl)].slice(0, PREHEAT_LIST_LIMIT);
-        await kv.put(PREHEAT_LIST_KEY, JSON.stringify(next), { expirationTtl: KV_TTL_SECONDS });
+        await kv.put(PREHEAT_LIST_KEY, JSON.stringify(next), { expirationTtl: PREHEAT_LIST_TTL_SECONDS });
         return next;
     } catch (e) {
         console.error(`[x-cache] 预热清单写入失败: ${e?.message ?? e}`);
@@ -299,6 +328,9 @@ export function applyCacheLabel(response, label) {
 /** 用 KV 存的 entry 重建响应（补 Content-Disposition，返回给客户端时头部与原路径一致） */
 function buildResponseFromEntry(entry, source) {
     const headers = { ...NO_STORE_HEADERS };
+    // 与 index.js 其它失败分支(403/404/500)一致补 ACAO：STALE 替换失败响应后浏览器端仍可读内容
+    // （KV-HIT 走同一重建函数，一并覆盖）
+    headers['Access-Control-Allow-Origin'] = '*';
     headers['Content-Type'] = entry.contentType || 'text/plain;charset=UTF-8';
     if (entry.contentDisposition) headers['Content-Disposition'] = entry.contentDisposition;
     headers['X-Cache'] = source;
@@ -308,6 +340,8 @@ function buildResponseFromEntry(entry, source) {
 /** 缓存命中的响应：Cache API 返回的 Response 头部不可变，这里重建一份可改头的响应 */
 function buildResponseFromCacheHit(hit, body) {
     const headers = { ...NO_STORE_HEADERS };
+    // 补 ACAO：与 buildResponseFromEntry 对齐，避免 CACHE-HIT 与 KV-HIT/STALE 两种命中的 CORS 行为分裂
+    headers['Access-Control-Allow-Origin'] = '*';
     const contentType = hit.headers.get('Content-Type');
     if (contentType) headers['Content-Type'] = contentType;
     const contentDisposition = hit.headers.get('Content-Disposition');
@@ -330,10 +364,10 @@ export async function readCachedDownload({ cache, kv, request, now = Date.now() 
         return null;
     }
 
-    // 1) Cache API
+    // 1) Cache API（键为哈希形态，见 cacheRequestKey）
     if (cache && typeof cache.match === 'function') {
         try {
-            const hit = await cache.match(new Request(canonicalUrl, { method: 'GET' }));
+            const hit = await cache.match(await cacheRequestKey(canonicalUrl));
             if (hit && hit.status === 200) {
                 const body = await hit.text();
                 return buildResponseFromCacheHit(hit, body);
@@ -351,6 +385,12 @@ export async function readCachedDownload({ cache, kv, request, now = Date.now() 
             if (raw === null || raw === undefined || raw === '') return null;
             const entry = typeof raw === 'string' ? JSON.parse(raw) : raw;
             if (!entry || typeof entry !== 'object' || typeof entry.body !== 'string') return null;
+            // 年龄判断：超过新鲜窗口(6h)的条目不作为正常命中（返回 null 走原路径重新拉取），
+            // 超龄条目只在上游失败时由 readStaleFromKv 兜底使用；
+            // storedAt 在未来（时钟偏移）同样不命中——对齐 isFreshEntry 的 now-storedAt>=0 语义
+            const storedAt = Date.parse(entry.storedAt);
+            const ageMs = now - storedAt;
+            if (!Number.isFinite(storedAt) || ageMs < 0 || ageMs >= KV_FRESH_WINDOW_SECONDS * 1000) return null;
             return buildResponseFromEntry(entry, CACHE_LABEL.kvHit);
         } catch (e) {
             console.error(`[x-cache] KV 读取失败: ${e?.message ?? e}`);
@@ -358,6 +398,37 @@ export async function readCachedDownload({ cache, kv, request, now = Date.now() 
     }
 
     return null;
+}
+
+/**
+ * stale-on-error 兜底读取：上游失败(status>=400)时从 KV 捞旧内容回吐（X-Cache: STALE）。
+ * 不设 6h 新鲜窗口——6-24h 的超龄条目正是本函数的目标数据；上限按 storedAt 复核
+ * 不超过 KV_TTL_SECONDS(24h)（双保险：防 KV 实现不严格执行 TTL 时回吐任意陈旧内容），
+ * storedAt 在未来（时钟偏移）同样拒绝。命中时日志携带 age 小时数。
+ * refresh/nocache bypass 的失败请求同样允许走到这里（断粮场景 refresh 恰恰最需要兜底）。
+ * 任何异常返回 null（兜底失败不影响原失败响应的正常返回）。
+ * @param {{kv?: any, request: Request, now?: number}} deps 与 readCachedDownload 相同的注入风格
+ * @returns {Promise<Response|null>} 命中返回 X-Cache: STALE 的响应，未命中/异常返回 null
+ */
+export async function readStaleFromKv({ kv, request, now = Date.now() } = {}) {
+    try {
+        if (!kv || typeof kv.get !== 'function') return null;
+        const canonicalUrl = normalizeCacheUrl(request.url);
+        const key = await kvKey(canonicalUrl);
+        const raw = await kv.get(key);
+        if (raw === null || raw === undefined || raw === '') return null;
+        const entry = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        if (!entry || typeof entry !== 'object' || typeof entry.body !== 'string') return null;
+        const storedAt = Date.parse(entry.storedAt);
+        if (!Number.isFinite(storedAt)) return null;
+        const ageMs = now - storedAt;
+        if (ageMs < 0 || ageMs > KV_TTL_SECONDS * 1000) return null;
+        console.log(`[x-cache] STALE 兜底命中 (age=${(ageMs / 3600000).toFixed(1)}h)`);
+        return buildResponseFromEntry(entry, CACHE_LABEL.stale);
+    } catch (e) {
+        console.error(`[x-cache] STALE 兜底读取失败: ${e?.message ?? e}`);
+        return null;
+    }
 }
 
 /**
@@ -414,7 +485,7 @@ export async function storeDownload({ cache, kv, request, response, bypassRead =
                         'Cache-Control': `public, max-age=${CACHE_TTL_SECONDS}`,
                     },
                 });
-                await cache.put(new Request(canonicalUrl, { method: 'GET' }), cacheable);
+                await cache.put(await cacheRequestKey(canonicalUrl), cacheable);
                 stored.cache = true;
             } catch (e) {
                 console.error(`[x-cache] Cache API 写入失败: ${e?.message ?? e}`);
@@ -424,7 +495,7 @@ export async function storeDownload({ cache, kv, request, response, bypassRead =
         // 2) KV（写前 get 查重：已存在且 10min 内写过则跳过，控写配额）
         // bypassRead 强制覆盖的动机：refresh/nocache 请求拿到了新内容，若被 10min 写冷却跳写，
         // 新内容只进了 30min 的 Cache API；30min 后 Cache API 过期、KV 里的旧内容会「回潮」——
-        // 用户明明手动刷新过，却看到最长 6h 的旧订阅。
+        // 用户明明手动刷新过，却看到最长 24h（其中 6-24h 段仅 stale 兜底可读）的旧订阅。
         if (kv && typeof kv.put === 'function' && typeof kv.get === 'function') {
             try {
                 const key = await kvKey(canonicalUrl);
@@ -486,12 +557,16 @@ export async function invalidateAllDownloads({ cache, kv } = {}) {
 
         const failedUrls = [];
         for (let i = 0; i < list.length; i += INVALIDATE_BATCH_SIZE) {
+            const batch = list.slice(i, i + INVALIDATE_BATCH_SIZE);
+            // 先逐条算好本批 Cache API 哈希键再并发删（哈希是纯 CPU 微秒级，预计算无感），
+            // 保证批内 cache.delete 齐发（与原同步构造 Request 的并发行为一致，批间仍串行）
+            const cacheKeys = await Promise.all(batch.map((url) => cacheRequestKey(url)));
             const outcomes = await Promise.all(
-                list.slice(i, i + INVALIDATE_BATCH_SIZE).map(async (url) => {
+                batch.map(async (url, j) => {
                     let ok = true;
                     if (cache && typeof cache.delete === 'function') {
                         try {
-                            await cache.delete(new Request(url, { method: 'GET' }));
+                            await cache.delete(cacheKeys[j]);
                         } catch (e) {
                             ok = false;
                             console.error(`[x-cache] 失效删除 Cache API 失败 ${url}: ${e?.message ?? e}`);
