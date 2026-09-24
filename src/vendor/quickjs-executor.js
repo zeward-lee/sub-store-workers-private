@@ -28,6 +28,7 @@
 import quickjsWasmModule from './quickjs.wasm';
 import YAML from '@/utils/yaml';
 import { createDeadlineGuard, SCRIPT_TIMEOUT_MS, isDeadlineExceeded, formatScriptError } from './quickjs-timeout';
+import { createGeoipInjector, geoipMapToRecord } from './geoip-czdb';
 
 // 使用全局作用域缓存，避免跨请求重复编译 WASM
 if (typeof globalThis.__quickjsModule === 'undefined') {
@@ -75,6 +76,25 @@ function getErrorMessage(context, errorHandle) {
     } catch (e2) {
         return 'Unknown QuickJS error';
     }
+}
+
+/**
+ * geoip 归属地预取注入器（懒初始化单例）
+ *
+ * BASE 优先级：env.GEOIP_CZDB_BASE（'off'/'disabled' 关闭）> 内置默认（geoip-czdb.js）。
+ * fetch 用全局 fetch（Workers 环境）。预取失败/超时/关闭一律空 Map，绝不阻塞脚本执行。
+ */
+var __geoipInjector = null;
+var __geoipLogShown = false; // 日志一次性标志：Workers 高频路径不重复打（含关闭模式日志）
+function getGeoipInjector() {
+    if (__geoipInjector === null) {
+        __geoipInjector = createGeoipInjector({
+            fetchFn: (typeof fetch === 'function') ? function () {
+                return fetch.apply(globalThis, arguments);
+            } : null,
+        });
+    }
+    return __geoipInjector;
 }
 
 /**
@@ -153,6 +173,32 @@ function injectAPI(context, api) {
         }
         if (setResult.value) {
             setResult.value.dispose();
+        }
+    }
+
+    // geoip 归属地特例：函数无法跨 JSON.stringify 边界，因此只注入 __geoipData 纯数据
+    // （由上方 api 键循环完成），再在沙箱内组装 geoip.lookup(ip) 同步查询对象：
+    // 命中返回 {country,province,city,isp}，未命中/非字符串/关闭模式返回 null。
+    // fail-open：geoip 是可选增强，注入失败只告警不抛，脚本内 geoip 为 undefined 由用户脚本容错
+    if (Object.prototype.hasOwnProperty.call(api, '__geoipData')) {
+        var geoipSnippet =
+            'var geoip = {\n' +
+            '  lookup: function(ip) {\n' +
+            '    if (typeof ip !== "string") return null;\n' +
+            '    if (!Object.prototype.hasOwnProperty.call(__geoipData, ip)) return null;\n' +
+            '    var r = __geoipData[ip];\n' +
+            '    return (r === undefined || r === null) ? null : r;\n' +
+            '  }\n' +
+            '};';
+        var geoipResult = context.evalCode(geoipSnippet);
+        if (geoipResult.error) {
+            var geoipErrMsg = getErrorMessage(context, geoipResult.error);
+            geoipResult.error.dispose();
+            console.warn('[geoip] 注入失败(已忽略): ' + geoipErrMsg);
+        } else {
+            if (geoipResult.value) {
+                geoipResult.value.dispose();
+            }
         }
     }
 
@@ -452,6 +498,36 @@ function createScriptFunction(script, name, $arguments, $options) {
         var _hasContent = !!(
             (proxies && proxies.$content) || (proxies && proxies.$files)
         );
+
+        // ========== geoip 归属地预取注入 ==========
+        // 触发条件：脚本文本含 'geoip' 字样（零引用零开销）。
+        // 仅对 server 为 IP 字面量的节点生效（域名节点不做 DNS 解析，lookup 返回 null）。
+        // 预取失败/超时/功能关闭 → 空 Map → lookup 恒 null，绝不阻塞脚本执行。
+        // 注入走 api.__geoipData（JSON 安全），geoip.lookup 由 injectAPI 在沙箱内组装；
+        // func/nodeFunc/content 三条路径都经 executeInSandbox(api)，一次注入全路径生效。
+        // 日志（含关闭模式）经 __geoipLogShown 只在首次输出，避免高频路径刷屏。
+        var _geoipInjector = getGeoipInjector();
+        if (_geoipInjector.shouldPrefetch(script)) {
+            var _geoipMap = new Map();
+            try {
+                _geoipMap = await _geoipInjector.prefetch(proxies);
+            } catch (_geoipErr) {
+                if (!__geoipLogShown) {
+                    __geoipLogShown = true;
+                    console.warn('[geoip] 预取失败(已忽略): ' + ((_geoipErr && _geoipErr.message) || _geoipErr));
+                }
+            }
+            if (_geoipMap && _geoipMap.disabled) {
+                if (!__geoipLogShown) {
+                    __geoipLogShown = true;
+                    console.log('[geoip] 功能已关闭(GEOIP_CZDB_BASE=off)，lookup 恒返回 null');
+                }
+            } else if (!__geoipLogShown) {
+                __geoipLogShown = true;
+                console.log('[geoip] 预取 ' + (_geoipMap && _geoipMap.size ? _geoipMap.size : 0) + ' 个 IP 归属地');
+            }
+            api.__geoipData = geoipMapToRecord(_geoipMap);
+        }
 
         // ========== func 模式 ==========
         try {
