@@ -38,6 +38,18 @@ let kvMemo = {
     cacheSnapshot: '',
     rootSnapshot: '',
 };
+/** 并发冷启动合并：多个请求同时命中空 memo 时只解析一次，避免面板并发把 CPU 打爆 */
+let kvMemoLoading = null;
+
+function isKvMemoFresh(kvBinding, now) {
+    return (
+        kvMemo.kv === kvBinding &&
+        kvMemo.cache &&
+        kvMemo.root &&
+        now - kvMemo.at >= 0 &&
+        now - kvMemo.at < KV_MEMO_TTL_MS
+    );
+}
 
 export class OpenAPI {
     constructor(name = 'untitled', debug = false) {
@@ -80,68 +92,83 @@ export class OpenAPI {
 
         const now = Date.now();
         // 快路径：同 isolate 60s 内已解析过同一 KV 绑定，直接复用，省掉 3MB 读+parse
-        if (
-            kvMemo.kv === kvBinding &&
-            kvMemo.cache &&
-            kvMemo.root &&
-            now - kvMemo.at >= 0 &&
-            now - kvMemo.at < KV_MEMO_TTL_MS
-        ) {
-            this.cache = kvMemo.cache;
-            this.root = kvMemo.root;
-            this._cacheSnapshot = kvMemo.cacheSnapshot;
-            this._rootSnapshot = kvMemo.rootSnapshot;
-            if (!this.readOnlyRequest) installConsoleLogCapture(this);
+        if (isKvMemoFresh(kvBinding, now)) {
+            this.applyKvMemo(kvMemo);
             return;
         }
+
+        // 并发合并：同一 isolate 内多个请求同时冷启动时只解析一次
+        if (!kvMemoLoading || kvMemoLoading.kv !== kvBinding) {
+            const promise = this.loadKvMemo(kvBinding).then((memo) => {
+                kvMemo = memo;
+                return memo;
+            });
+            kvMemoLoading = { kv: kvBinding, promise };
+            promise
+                .finally(() => {
+                    if (kvMemoLoading?.promise === promise) kvMemoLoading = null;
+                })
+                .catch(() => {});
+        }
+        const memo = await kvMemoLoading.promise;
+        this.applyKvMemo(memo);
+    }
+
+    /** 把 memo 挂到当前 $ 实例（每次请求都指向同一批对象，避免重复解析） */
+    applyKvMemo(memo) {
+        this.cache = memo.cache;
+        this.root = memo.root;
+        this._cacheSnapshot = memo.cacheSnapshot;
+        this._rootSnapshot = memo.rootSnapshot;
+        if (!this.readOnlyRequest) installConsoleLogCapture(this);
+    }
+
+    /** 真正读 KV 并解析（只在一个 isolate 的冷启动/过期后执行一次） */
+    async loadKvMemo(kvBinding) {
+        let cache = {};
+        let root = {};
+        let cacheSnapshot = '{}';
+        let rootSnapshot = '{}';
 
         // 加载主缓存
         try {
             const raw = await kvBinding.get(this.name, 'text', { cacheTtl: 60 });
             if (raw) {
-                this.cache = JSON.parse(raw);
-                if (!isPlainObject(this.cache)) {
-                    this.cache = {};
+                cache = JSON.parse(raw);
+                if (!isPlainObject(cache)) {
+                    cache = {};
                 }
-                this._cacheSnapshot = raw;
-            } else {
-                this.cache = {};
-                this._cacheSnapshot = '{}';
+                cacheSnapshot = raw;
             }
         } catch (e) {
             this.error(`Failed to load cache from KV: ${e.message}`);
-            this.cache = {};
-            this._cacheSnapshot = '{}';
+            cache = {};
+            cacheSnapshot = '{}';
         }
 
         // 加载根数据
         try {
             const raw = await kvBinding.get('root', 'text', { cacheTtl: 60 });
             if (raw) {
-                this.root = JSON.parse(raw);
-                if (!isPlainObject(this.root)) {
-                    this.root = {};
+                root = JSON.parse(raw);
+                if (!isPlainObject(root)) {
+                    root = {};
                 }
-                this._rootSnapshot = raw;
-            } else {
-                this.root = {};
-                this._rootSnapshot = '{}';
+                rootSnapshot = raw;
             }
         } catch (e) {
             this.error(`Failed to load root from KV: ${e.message}`);
-            this.root = {};
+            root = {};
         }
 
-        kvMemo = {
-            at: now,
+        return {
+            at: Date.now(),
             kv: kvBinding,
-            cache: this.cache,
-            root: this.root,
-            cacheSnapshot: this._cacheSnapshot,
-            rootSnapshot: this._rootSnapshot,
+            cache,
+            root,
+            cacheSnapshot,
+            rootSnapshot,
         };
-
-        if (!this.readOnlyRequest) installConsoleLogCapture(this);
     }
 
     // 同步初始化（空操作）

@@ -1409,6 +1409,7 @@ check('open-api.js：模块级 KV 解析复用 + 只读请求不回写', () => {
     const src = fs.readFileSync(path.join(ROOT, 'src/vendor/open-api.js'), 'utf8');
     ok(src.includes('KV_MEMO_TTL_MS'), '缺少 memo TTL');
     ok(src.includes('kvMemo.kv === kvBinding'), '缺少 memo 命中判断');
+    ok(src.includes('kvMemoLoading'), '缺少并发冷启动合并');
     ok(src.includes('this.readOnlyRequest = false'), '构造函数缺少 readOnlyRequest 初始化');
     ok(src.includes('async persistCache({ readOnly = false } = {})'), 'persistCache 缺少 readOnly 参数');
 });
