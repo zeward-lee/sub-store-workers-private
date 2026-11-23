@@ -574,7 +574,7 @@ Account Resources 选择 **Include → 你的账号**。
 
 | 类型 | 文件 | 方式 |
 |---|---|---|
-| 上游几乎不改，但 Workers 完全不适用 | `restful/miscs.js`、`utils/env.js` | **整文件覆盖**：直接由 `src/` 命中，靠漂移检测盯上游是否变动 |
+| 与上游差异大、需大段替换/增补 | `restful/miscs.js`、`utils/env.js` | **整文件覆盖**：直接由 `src/` 命中，靠漂移检测盯上游是否变动 |
 | 只差几行，需要继续跟随上游演进 | `core/app.js`、`restful/token.js` | **补丁**：`.generated/` 中存放「上游原件 + `patches/` 应用结果」 |
 
 `@/` 解析顺序固定三级：
