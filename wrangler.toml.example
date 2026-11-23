@@ -9,6 +9,11 @@ compatibility_flags = ["nodejs_compat"]
 binding = "SUB_STORE_DATA"
 id = "你的KV命名空间ID"
 
+# R2：产物外置（/artifact/<name> 直读，CPU≈0）
+[[r2_buckets]]
+binding = "SUBSTORE_R2"
+bucket_name = "substore-artifacts"
+
 # 定时同步（每天 23:55 执行）
 [triggers]
 crons = ["55 15 * * *"]
@@ -19,3 +24,5 @@ crons = ["55 15 * * *"]
 SCRIPT_ENGINE = "quickjs"
 SUB_STORE_BACKEND_CUSTOM_NAME = "Workers"
 SUB_STORE_BACKEND_CUSTOM_ICON = "https://cdn.jsdelivr.net/gh/Yu9191/sub-store-workers@main/png/cloudflare.png"
+# 产物外置后的公开访问源（/artifact/<name> 链接用）
+SUB_STORE_PUBLIC_ORIGIN = "https://ssub.feeee.cc.cd"

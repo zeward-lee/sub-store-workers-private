@@ -101,6 +101,18 @@ export default {
             const url = new URL(request.url);
             let pathname = url.pathname;
 
+            // [R2] 产物外置直读：/artifact/<name> 直接从 R2 流式返回。
+            // 放在所有鉴权/KV 加载之前 —— 不读 KV、不解析数据，CPU≈0。
+            if (pathname.startsWith('/artifact/')) {
+                if (request.method !== 'GET' && request.method !== 'HEAD') {
+                    return new Response(JSON.stringify({ status: 'failed', message: 'Method not allowed' }), {
+                        status: 405,
+                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+                    });
+                }
+                return serveArtifactFromR2(env, request, pathname);
+            }
+
             // 路径前缀鉴权（可选）
             // 配置 SUB_STORE_FRONTEND_BACKEND_PATH = "/你的密码" 后
             // 前端后端地址填: https://xxx.pages.dev/你的密码
@@ -145,7 +157,10 @@ export default {
 
             // [x-cache] 落点A：/download 缓存层读路径 —— Cache API → KV → 未命中放行
             // 命中直接返回，不加载 KV 数据、不进 express 分发（省 CPU，避免 1102）
-            isDownloadRequest = xCache.isDownloadPath(pathname, request.method);
+            // 带 Authorization 的请求一律绕过缓存（读/写都跳过），避免私有响应进共享缓存。
+            isDownloadRequest =
+                !xCache.hasAuthorizationHeader(request) &&
+                xCache.isDownloadPath(pathname, request.method);
             const cacheBypass = isDownloadRequest && xCache.shouldBypassCacheRead(request.url);
             // 读阶段结束即定标签：未命中（含 bypass）→ MISS；命中路径由 x-cache.js 重建响应时已带标签
             isDownloadRequest && (cacheLabel = xCache.CACHE_LABEL.miss);
@@ -164,6 +179,10 @@ export default {
 
             // 注入环境变量
             globalThis.__workerEnv = env;
+
+            // [x-cache] 产物读请求标记：本次请求不写回任何 KV（日志/资源缓存也不落盘），
+            // 避免每次下载都 JSON.stringify 整个 root（1MB+）并回写 KV（CPU 1102 / KV 写配额双杀）。
+            $.readOnlyRequest = isDownloadRequest;
 
             // 从 KV 加载数据
             await $.initFromKV(env.SUB_STORE_DATA);
@@ -239,7 +258,7 @@ export default {
                             try {
                                 ctx.waitUntil(
                                     Promise.all([
-                                        $.persistCache(),
+                                        $.persistCache({ readOnly: isDownloadRequest }),
                                         ...($.pendingPushes || []),
                                     ]).catch((e) => console.error(`[x-cache] STALE 早退冲刷失败: ${e?.message ?? e}`)),
                                 );
@@ -298,11 +317,16 @@ export default {
                 console.error(`[x-cache] 失效调度失败: ${e?.message ?? e}`);
             }
 
-            // 禁止 Cloudflare CDN/边缘节点缓存动态 API 响应
-            // 未设置此头时，不同 URL 路径（如 /share/ 和 /download/）的响应可能被独立缓存，
-            // 导致同一订阅在不同接口返回不一致（陈旧）的数据
-            response.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate');
-            response.headers.set('CDN-Cache-Control', 'no-store');
+            // 缓存头分层：
+            // - 产物读（/download）200：public, max-age=60, s-maxage=300（允许浏览器/边缘短缓存）
+            // - 其余动态 API（含管理 API、下载失败响应）：no-store，禁止 CDN 缓存
+            if (isDownloadRequest && response.status === 200) {
+                response.headers.set('Cache-Control', 'public, max-age=60, s-maxage=300');
+                response.headers.set('CDN-Cache-Control', 'public, max-age=300');
+            } else {
+                response.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+                response.headers.set('CDN-Cache-Control', 'no-store');
+            }
 
             if (isAuthDisabledManagementApi) {
                 response.headers.set('X-Sub-Store-Security-Warning', 'SUB_STORE_FRONTEND_BACKEND_PATH is not configured; management API is public');
@@ -310,7 +334,7 @@ export default {
 
             // 回写 KV + 确保推送完成
             ctx.waitUntil(Promise.all([
-                $.persistCache(),
+                $.persistCache({ readOnly: isDownloadRequest }),
                 ...($.pendingPushes || []),
             ]));
             $.pendingPushes = [];
@@ -320,7 +344,7 @@ export default {
             console.error(`Unhandled error: ${e.message}\n${e.stack}`);
             // 出错也尝试回写
             ctx.waitUntil(Promise.all([
-                $.persistCache(),
+                $.persistCache({ readOnly: isDownloadRequest }),
                 ...($.pendingPushes || []),
             ]));
             $.pendingPushes = [];
@@ -362,6 +386,103 @@ function validateKVBinding(env) {
     };
 }
 
+/** [R2] 产物对象键：统一前缀 + URL 编码后的产物名（禁止出现 / 与 ..） */
+const ARTIFACT_ROUTE_PREFIX = '/artifact/';
+const ARTIFACT_R2_PREFIX = 'artifacts/';
+const DEFAULT_PUBLIC_ORIGIN = 'https://ssub.feeee.cc.cd';
+
+function artifactPublicOrigin(env) {
+    return String(env?.SUB_STORE_PUBLIC_ORIGIN || DEFAULT_PUBLIC_ORIGIN).replace(/\/+$/, '');
+}
+
+function artifactObjectKey(name) {
+    return `${ARTIFACT_R2_PREFIX}${name}`;
+}
+
+async function sha256Hex(text) {
+    try {
+        const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(text)));
+        return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+    } catch {
+        // crypto.subtle 不可用时的降级：用长度+时间戳做 cache-bust，不影响直读
+        return `${String(text).length.toString(16)}${Date.now().toString(16)}`;
+    }
+}
+
+/** 产物写入 R2（失败返回 null，调用方保留 Gist 链接兜底） */
+async function putArtifactToR2(env, name, content) {
+    try {
+        const bucket = env?.SUBSTORE_R2;
+        if (!bucket || typeof bucket.put !== 'function') return null;
+        const encoded = encodeURIComponent(String(name));
+        const bodyText = String(content ?? '');
+        const hash = await sha256Hex(bodyText);
+        await bucket.put(artifactObjectKey(encoded), bodyText, {
+            httpMetadata: { contentType: 'text/plain; charset=utf-8' },
+        });
+        return {
+            key: artifactObjectKey(encoded),
+            hash,
+            url: `${artifactPublicOrigin(env)}${ARTIFACT_ROUTE_PREFIX}${encoded}?v=${hash.slice(0, 12)}`,
+        };
+    } catch (e) {
+        console.error(`[R2] 产物 ${name} 上传失败: ${e?.message ?? e}`);
+        return null;
+    }
+}
+
+/** /artifact/<name>：R2 对象直出（body 流式返回，CPU≈0），支持 ETag/304 与 HEAD */
+async function serveArtifactFromR2(env, request, pathname) {
+    const fail = (status, message) =>
+        new Response(JSON.stringify({ status: 'failed', message }), {
+            status,
+            headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Cache-Control': 'no-store',
+            },
+        });
+    try {
+        let name;
+        try {
+            name = decodeURIComponent(pathname.slice(ARTIFACT_ROUTE_PREFIX.length));
+        } catch {
+            return fail(400, 'Invalid artifact name');
+        }
+        if (!name || name.startsWith('/') || name.includes('..')) {
+            return fail(400, 'Invalid artifact name');
+        }
+        const bucket = env?.SUBSTORE_R2;
+        if (!bucket || typeof bucket.get !== 'function') {
+            return fail(404, 'R2 binding SUBSTORE_R2 is not configured');
+        }
+        const key = artifactObjectKey(encodeURIComponent(name));
+        const isHead = request.method === 'HEAD';
+        const object = isHead && typeof bucket.head === 'function' ? await bucket.head(key) : await bucket.get(key);
+        if (!object) return fail(404, 'Artifact not found');
+        const etag = object.httpEtag || null;
+        const headers = {
+            'Content-Type': object.httpMetadata?.contentType || 'text/plain; charset=utf-8',
+            'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(name)}`,
+            'Cache-Control': 'public, max-age=60, s-maxage=300',
+            'CDN-Cache-Control': 'public, max-age=300',
+            'Access-Control-Allow-Origin': '*',
+            'X-Artifact-Store': 'r2',
+            ...(etag ? { ETag: etag } : {}),
+        };
+        if (etag && request.headers.get('if-none-match') === etag) {
+            return new Response(null, { status: 304, headers });
+        }
+        if (isHead) {
+            return new Response(null, { status: 200, headers });
+        }
+        return new Response(object.body, { status: 200, headers });
+    } catch (e) {
+        console.error(`[R2] 产物读取失败: ${e?.message ?? e}`);
+        return fail(500, 'Failed to read artifact from R2');
+    }
+}
+
 /** 定时同步 artifacts 到 Gist */
 async function cronSyncArtifacts(env) {
     try {
@@ -371,9 +492,11 @@ async function cronSyncArtifacts(env) {
 
         console.log(`[Cron] Sub-Store Workers v${version} 开始同步...`);
 
-        const settings = $.read(SETTINGS_KEY);
-        if (!settings?.githubUser || !settings?.gistToken) {
-            console.log('[Cron] 未配置 GitHub Token，跳过同步');
+        const settings = $.read(SETTINGS_KEY) || {};
+        const hasGist = Boolean(settings.githubUser && settings.gistToken);
+        const hasR2 = Boolean(env?.SUBSTORE_R2?.put);
+        if (!hasGist && !hasR2) {
+            console.log('[Cron] 未配置 GitHub Token / R2 binding，跳过同步');
             return;
         }
 
@@ -437,6 +560,7 @@ async function cronSyncArtifacts(env) {
         const files = {};
         const valid = [];
         const invalid = [];
+        const r2Published = new Map();
 
         await Promise.all(
             allArtifacts.map(async (artifact) => {
@@ -456,6 +580,9 @@ async function cronSyncArtifacts(env) {
                     });
 
                     files[encodeURIComponent(artifact.name)] = { content: output };
+                    // [R2] 产物外置：先写 R2，成功后 artifact.url 指向自身 /artifact/ 路由
+                    const r2Info = await putArtifactToR2(env, artifact.name, output);
+                    if (r2Info) r2Published.set(artifact.name, r2Info);
                     valid.push(artifact.name);
                 } catch (e) {
                     console.error(`[Cron] 生成 ${artifact.name} 失败: ${e.message ?? e}`);
@@ -471,34 +598,46 @@ async function cronSyncArtifacts(env) {
             return;
         }
 
-        // 上传到 Gist
-        const resp = await syncToGist(files);
-        const body = JSON.parse(resp.body);
+        // 上传到 Gist（仅在配置了 GitHub Token 时；R2 已单独写入，可无 Gist 运行）
+        let gistBody = null;
+        if (hasGist) {
+            const resp = await syncToGist(files);
+            gistBody = JSON.parse(resp.body);
+        } else {
+            console.log('[Cron] 未配置 GitHub Token，跳过 Gist 上传（产物仅写入 R2）');
+        }
 
-        // 更新 artifact URL
+        // 更新 artifact URL：R2 优先，其次 Gist
         for (const artifact of allArtifacts) {
             if (artifact.sync && artifact.source && valid.includes(artifact.name)) {
                 artifact.updated = new Date().getTime();
-                let gistFiles = body.files;
-                let isGitLab;
-                if (Array.isArray(gistFiles)) {
-                    isGitLab = true;
-                    gistFiles = Object.fromEntries(gistFiles.map((item) => [item.path, item]));
+                const r2Info = r2Published.get(artifact.name);
+                if (r2Info) {
+                    artifact.url = r2Info.url;
+                } else if (gistBody) {
+                    let gistFiles = gistBody.files;
+                    let isGitLab;
+                    if (Array.isArray(gistFiles)) {
+                        isGitLab = true;
+                        gistFiles = Object.fromEntries(gistFiles.map((item) => [item.path, item]));
+                    }
+                    const raw_url = gistFiles[encodeURIComponent(artifact.name)]?.raw_url;
+                    artifact.url = isGitLab ? raw_url : raw_url?.replace(/\/raw\/[^/]*\/(.*)/, '/raw/$1');
                 }
-                const raw_url = gistFiles[encodeURIComponent(artifact.name)]?.raw_url;
-                artifact.url = isGitLab ? raw_url : raw_url?.replace(/\/raw\/[^/]*\/(.*)/, '/raw/$1');
             }
         }
 
         $.write(allArtifacts, ARTIFACTS_KEY);
 
-        // Gist 备份上传
-        try {
-            console.log('[Cron] 上传 Gist 备份...');
-            await gistBackupAction('upload');
-            console.log('[Cron] Gist 备份完成');
-        } catch (e) {
-            console.error(`[Cron] Gist 备份失败: ${e.message ?? e}`);
+        // Gist 备份上传（仅 Gist 模式下有意义）
+        if (hasGist) {
+            try {
+                console.log('[Cron] 上传 Gist 备份...');
+                await gistBackupAction('upload');
+                console.log('[Cron] Gist 备份完成');
+            } catch (e) {
+                console.error(`[Cron] Gist 备份失败: ${e.message ?? e}`);
+            }
         }
 
         await $.persistCache();

@@ -20,7 +20,7 @@
  */
 
 /** Cache API 主缓存 TTL（秒） */
-export const CACHE_TTL_SECONDS = 1800;
+export const CACHE_TTL_SECONDS = 300;
 /**
  * KV 兜底缓存 TTL（秒，24h）。
  * 0-6h 为正常新鲜窗口（readCachedDownload 正常命中）；6-24h 仅作 stale 兜底池
@@ -75,10 +75,13 @@ export const CACHE_LABEL = {
 /** 标签合法性：只允许枚举内的值（防止内部误传导致观测头污染） */
 const CACHE_LABEL_VALUES = Object.values(CACHE_LABEL);
 
-/** 缓存层返回给客户端的头（与原路径 :189-190 保持一致，避免行为漂移） */
-const NO_STORE_HEADERS = {
-    'Cache-Control': 'no-store, no-cache, must-revalidate',
-    'CDN-Cache-Control': 'no-store',
+/**
+ * 产物读路径返回给客户端的缓存头（brief：public, max-age=60, s-maxage=300）。
+ * 仅用于 /download 的 200 响应与缓存命中；管理 API 仍由 index.js 打 no-store。
+ */
+const ARTIFACT_CACHE_HEADERS = {
+    'Cache-Control': 'public, max-age=60, s-maxage=300',
+    'CDN-Cache-Control': 'public, max-age=300',
 };
 
 /** 解析 crypto.subtle（Workers 与 node>=19 均存在 globalThis.crypto） */
@@ -163,6 +166,19 @@ export function validateCandidate(status, bodyByteLength) {
 export function isDownloadPath(pathname, method) {
     if (String(method || 'GET').toUpperCase() !== 'GET') return false;
     return typeof pathname === 'string' && pathname.startsWith('/download');
+}
+
+/**
+ * 请求是否携带 Authorization 头：带认证的请求一律不进产物缓存（读与写都跳过）。
+ * @param {Request} request
+ * @returns {boolean}
+ */
+export function hasAuthorizationHeader(request) {
+    try {
+        return Boolean(request?.headers?.get?.('authorization'));
+    } catch {
+        return false;
+    }
 }
 
 /**
@@ -327,7 +343,7 @@ export function applyCacheLabel(response, label) {
 
 /** 用 KV 存的 entry 重建响应（补 Content-Disposition，返回给客户端时头部与原路径一致） */
 function buildResponseFromEntry(entry, source) {
-    const headers = { ...NO_STORE_HEADERS };
+    const headers = { ...ARTIFACT_CACHE_HEADERS };
     // 与 index.js 其它失败分支(403/404/500)一致补 ACAO：STALE 替换失败响应后浏览器端仍可读内容
     // （KV-HIT 走同一重建函数，一并覆盖）
     headers['Access-Control-Allow-Origin'] = '*';
@@ -339,7 +355,7 @@ function buildResponseFromEntry(entry, source) {
 
 /** 缓存命中的响应：Cache API 返回的 Response 头部不可变，这里重建一份可改头的响应 */
 function buildResponseFromCacheHit(hit, body) {
-    const headers = { ...NO_STORE_HEADERS };
+    const headers = { ...ARTIFACT_CACHE_HEADERS };
     // 补 ACAO：与 buildResponseFromEntry 对齐，避免 CACHE-HIT 与 KV-HIT/STALE 两种命中的 CORS 行为分裂
     headers['Access-Control-Allow-Origin'] = '*';
     const contentType = hit.headers.get('Content-Type');
@@ -424,7 +440,11 @@ export async function readStaleFromKv({ kv, request, now = Date.now() } = {}) {
         const ageMs = now - storedAt;
         if (ageMs < 0 || ageMs > KV_TTL_SECONDS * 1000) return null;
         console.log(`[x-cache] STALE 兜底命中 (age=${(ageMs / 3600000).toFixed(1)}h)`);
-        return buildResponseFromEntry(entry, CACHE_LABEL.stale);
+        const stale = buildResponseFromEntry(entry, CACHE_LABEL.stale);
+        // STALE 是兜底旧内容，不对外宣称可缓存（避免陈旧内容再被 CDN/浏览器放大）
+        stale.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+        stale.headers.set('CDN-Cache-Control', 'no-store');
+        return stale;
     } catch (e) {
         console.error(`[x-cache] STALE 兜底读取失败: ${e?.message ?? e}`);
         return null;
@@ -482,7 +502,8 @@ export async function storeDownload({ cache, kv, request, response, bypassRead =
                     headers: {
                         'Content-Type': contentType,
                         ...(contentDisposition ? { 'Content-Disposition': contentDisposition } : {}),
-                        'Cache-Control': `public, max-age=${CACHE_TTL_SECONDS}`,
+                        'Cache-Control': `public, max-age=60, s-maxage=${CACHE_TTL_SECONDS}`,
+                        'CDN-Cache-Control': `public, max-age=${CACHE_TTL_SECONDS}`,
                     },
                 });
                 await cache.put(await cacheRequestKey(canonicalUrl), cacheable);

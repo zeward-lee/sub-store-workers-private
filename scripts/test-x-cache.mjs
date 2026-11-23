@@ -275,7 +275,7 @@ await checkAsync('未命中（空 cache + 空 kv）→ null', async () => {
     eq(r, null);
 });
 
-await checkAsync('Cache API 命中 → X-Cache: CACHE-HIT，内容与头保留，Cache-Control 为 no-store', async () => {
+await checkAsync('Cache API 命中 → X-Cache: CACHE-HIT，内容与头保留，Cache-Control 为 public 60/300', async () => {
     const cache = new FakeCache();
     const canonical = xc.normalizeCacheUrl(DL_URL);
     const keyReq = await xc.cacheRequestKey(canonical);
@@ -291,8 +291,8 @@ await checkAsync('Cache API 命中 → X-Cache: CACHE-HIT，内容与头保留�
     eq(r.headers.get('X-Cache'), 'CACHE-HIT');
     eq(r.headers.get('Content-Type'), 'text/yaml');
     eq(r.headers.get('Content-Disposition'), 'attachment; filename="airport-a.yaml"');
-    eq(r.headers.get('Cache-Control'), 'no-store, no-cache, must-revalidate');
-    eq(r.headers.get('CDN-Cache-Control'), 'no-store');
+    eq(r.headers.get('Cache-Control'), 'public, max-age=60, s-maxage=300');
+    eq(r.headers.get('CDN-Cache-Control'), 'public, max-age=300');
     eq(r.headers.get('Access-Control-Allow-Origin'), '*', 'CACHE-HIT 与 KV-HIT/STALE 的 CORS 行为应一致');
     eq(await r.text(), BODY);
 });
@@ -315,7 +315,7 @@ await checkAsync('KV 命中 → X-Cache: KV-HIT，重建 body + 补 Content-Disp
     ok(r !== null, '应命中');
     eq(r.headers.get('X-Cache'), 'KV-HIT');
     eq(r.headers.get('Content-Disposition'), 'attachment; filename="airport-a.yaml"');
-    eq(r.headers.get('Cache-Control'), 'no-store, no-cache, must-revalidate');
+    eq(r.headers.get('Cache-Control'), 'public, max-age=60, s-maxage=300');
     eq(r.headers.get('Access-Control-Allow-Origin'), '*');
     eq(await r.text(), BODY);
 });
@@ -390,7 +390,7 @@ await checkAsync('合法响应 → 写 Cache API(哈希键) + KV(TTL 86400) + �
     ok(cacheKeyUrl.startsWith('https://xcache.invalid/'), `Cache API 键应为哈希形态: ${cacheKeyUrl}`);
     ok(!cacheKeyUrl.includes('secret'), 'Cache API 键不应含明文 token');
     const cachedResp = cache.map.get(cacheKeyUrl);
-    eq(cachedResp.headers.get('Cache-Control'), `public, max-age=${xc.CACHE_TTL_SECONDS}`);
+    eq(cachedResp.headers.get('Cache-Control'), `public, max-age=60, s-maxage=${xc.CACHE_TTL_SECONDS}`);
 
     const key = await xc.kvKey(canonical);
     const kvWrites = kv.writesFor(key);
@@ -1362,7 +1362,7 @@ check('index.js stale 接线（存在性检查）：status>=400 / 回吐日志 /
     const block = src.slice(iStale, iStore);
     ok(block.includes('} catch'), 'stale 兜底应整体 try/catch（异常回落原失败响应）');
     ok(
-        block.includes('$.persistCache()') && block.includes('$.pendingPushes = []'),
+        block.includes('$.persistCache(') && block.includes('$.pendingPushes = []'),
         'STALE 早退前应补例行冲刷（不丢 KV 回写与 pendingPushes）',
     );
 });
@@ -1373,6 +1373,44 @@ check('x-cache.js 含 STALE 标签 / readStaleFromKv / cacheRequestKey', () => {
     ok(x.includes('readStaleFromKv'), '缺 readStaleFromKv');
     ok(x.includes('cacheRequestKey'), '缺 cacheRequestKey');
     ok(x.includes('KV_FRESH_WINDOW_SECONDS'), '缺新鲜窗口常量');
+});
+
+// ---------------------------------------------------------------------------
+// 19. 认证绕过 / 只读产物请求 / R2 外置接线
+// ---------------------------------------------------------------------------
+console.log('\n[19] Authorization 绕过 + 只读请求 + R2 外置接线');
+
+check('hasAuthorizationHeader：有头 true，无头/异常 false', () => {
+    eq(xc.hasAuthorizationHeader(new Request(DL_URL, { headers: { Authorization: 'Bearer x' } })), true);
+    eq(xc.hasAuthorizationHeader(new Request(DL_URL)), false);
+    eq(xc.hasAuthorizationHeader(null), false);
+    eq(xc.hasAuthorizationHeader({}), false);
+});
+
+check('index.js：Authorization 绕过缓存 + 只读请求标记 + 产物 public 头', () => {
+    const src = fs.readFileSync(path.join(ROOT, 'src/index.js'), 'utf8');
+    ok(src.includes('xCache.hasAuthorizationHeader(request)'), '缺少 Authorization 绕过判断');
+    ok(src.includes('$.readOnlyRequest = isDownloadRequest'), '缺少只读请求标记');
+    ok(
+        src.includes('persistCache({ readOnly: isDownloadRequest })'),
+        'persistCache 未按请求传入 readOnly（并发安全）',
+    );
+    ok(
+        src.includes("response.headers.set('Cache-Control', 'public, max-age=60, s-maxage=300')"),
+        '产物 200 响应缺少 public 缓存头',
+    );
+    ok(src.includes("pathname.startsWith('/artifact/')"), '缺少 /artifact/ 直读路由');
+    ok(src.includes('putArtifactToR2('), '缺少 R2 写入');
+    ok(src.includes('SUBSTORE_R2'), '缺少 R2 binding 引用');
+    ok(src.includes('artifact.url = r2Info.url'), '产物 URL 未回写 R2 路由');
+});
+
+check('open-api.js：模块级 KV 解析复用 + 只读请求不回写', () => {
+    const src = fs.readFileSync(path.join(ROOT, 'src/vendor/open-api.js'), 'utf8');
+    ok(src.includes('KV_MEMO_TTL_MS'), '缺少 memo TTL');
+    ok(src.includes('kvMemo.kv === kvBinding'), '缺少 memo 命中判断');
+    ok(src.includes('this.readOnlyRequest = false'), '构造函数缺少 readOnlyRequest 初始化');
+    ok(src.includes('async persistCache({ readOnly = false } = {})'), 'persistCache 缺少 readOnly 参数');
 });
 
 // ---------------------------------------------------------------------------

@@ -23,6 +23,22 @@ function isPlainObject(obj) {
     );
 }
 
+/**
+ * 同 isolate 内的 KV 解析结果复用（60s，与 KV get 的 cacheTtl 对齐）。
+ * 每次请求都重新读 2MB(主数据)+1MB(root) 并 JSON.parse 是免费档 CPU 1102 的主要来源；
+ * 这里把已解析对象挂在模块级，同一 isolate 60s 内直接复用，跳过 KV 读与解析。
+ * 数据更新仍以 KV 为准：其它 isolate 的写入最迟 60s 后被本 isolate 看到（与现有 cacheTtl:60 同语义）。
+ */
+const KV_MEMO_TTL_MS = 60 * 1000;
+let kvMemo = {
+    at: 0,
+    kv: null,
+    cache: null,
+    root: null,
+    cacheSnapshot: '',
+    rootSnapshot: '',
+};
+
 export class OpenAPI {
     constructor(name = 'untitled', debug = false) {
         this.name = name;
@@ -42,6 +58,8 @@ export class OpenAPI {
         this._rootDirty = false;
         this._cacheSnapshot = '';
         this._rootSnapshot = '';
+        // 由 index.js 每个请求显式设置：产物读请求（/download）为 true，跳过所有 KV 回写
+        this.readOnlyRequest = false;
 
         const delay = (t, v) =>
             new Promise(function (resolve) {
@@ -59,6 +77,23 @@ export class OpenAPI {
         this._kvBinding = kvBinding;
         this._dirty = false;
         this._rootDirty = false;
+
+        const now = Date.now();
+        // 快路径：同 isolate 60s 内已解析过同一 KV 绑定，直接复用，省掉 3MB 读+parse
+        if (
+            kvMemo.kv === kvBinding &&
+            kvMemo.cache &&
+            kvMemo.root &&
+            now - kvMemo.at >= 0 &&
+            now - kvMemo.at < KV_MEMO_TTL_MS
+        ) {
+            this.cache = kvMemo.cache;
+            this.root = kvMemo.root;
+            this._cacheSnapshot = kvMemo.cacheSnapshot;
+            this._rootSnapshot = kvMemo.rootSnapshot;
+            if (!this.readOnlyRequest) installConsoleLogCapture(this);
+            return;
+        }
 
         // 加载主缓存
         try {
@@ -97,7 +132,16 @@ export class OpenAPI {
             this.root = {};
         }
 
-        installConsoleLogCapture(this);
+        kvMemo = {
+            at: now,
+            kv: kvBinding,
+            cache: this.cache,
+            root: this.root,
+            cacheSnapshot: this._cacheSnapshot,
+            rootSnapshot: this._rootSnapshot,
+        };
+
+        if (!this.readOnlyRequest) installConsoleLogCapture(this);
     }
 
     // 同步初始化（空操作）
@@ -106,8 +150,17 @@ export class OpenAPI {
     }
 
     // 回写缓存到 KV
-    async persistCache() {
+    async persistCache({ readOnly = false } = {}) {
         if (!this._kvBinding) return;
+        // 产物读请求（/download）由调用方显式传 readOnly：本请求不落盘任何 KV
+        // （含 console 日志、资源缓存），否则每次下载都会把整个 root（1MB+）
+        // JSON.stringify + PUT，直接触发 CPU 1102。
+        // 用参数而不是实例标志，避免并发请求之间互相串扰导致管理写被误跳过。
+        if (readOnly) {
+            this._dirty = false;
+            this._rootDirty = false;
+            return;
+        }
         const promises = [];
         if (this._dirty) {
             const current = JSON.stringify(this.cache, null, 2);
@@ -128,6 +181,13 @@ export class OpenAPI {
         if (promises.length > 0) {
             await Promise.all(promises);
         }
+        // 每次非只读请求结束后都让模块级 memo 指向当前活对象：
+        // 覆盖 backup 恢复（$.cache = content 整体替换）等场景，避免 memo 继续指向旧对象。
+        kvMemo.cache = this.cache;
+        kvMemo.root = this.root;
+        kvMemo.cacheSnapshot = this._cacheSnapshot;
+        kvMemo.rootSnapshot = this._rootSnapshot;
+        kvMemo.kv = this._kvBinding;
     }
 
     write(data, key) {

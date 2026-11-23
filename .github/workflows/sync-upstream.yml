@@ -183,6 +183,10 @@ jobs:
           binding = "SUB_STORE_DATA"
           id = "__KV_ID__"
 
+          [[r2_buckets]]
+          binding = "SUBSTORE_R2"
+          bucket_name = "substore-artifacts"
+
           [triggers]
           crons = ["55 15 * * *"]
 
@@ -190,6 +194,7 @@ jobs:
           SCRIPT_ENGINE = "quickjs"
           SUB_STORE_BACKEND_CUSTOM_NAME = "Workers"
           SUB_STORE_BACKEND_CUSTOM_ICON = "https://cdn.jsdelivr.net/gh/Yu9191/sub-store-workers@main/png/cloudflare.png"
+          SUB_STORE_PUBLIC_ORIGIN = "https://ssub.feeee.cc.cd"
           TOML
           sed -i 's/^          //' wrangler.toml
           sed -i "s/__KV_ID__/${{ secrets.KV_NAMESPACE_ID }}/" wrangler.toml
