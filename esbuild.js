@@ -5,6 +5,7 @@ const fs = require('fs');
 
 // 路径配置
 const WORKERS_SRC = path.resolve(__dirname, 'src');
+const GENERATED_SRC = path.resolve(__dirname, '.generated');
 const ORIGINAL_SRC = path.resolve(__dirname, '..', 'Sub-Store', 'backend', 'src');
 
 /** 插件：路径别名解析 */
@@ -37,7 +38,10 @@ const aliasPlugin = {
         build.onResolve({ filter: /^@\// }, (args) => {
             const relPath = args.path.slice(2); // strip "@/"
 
-            // 优先 Workers 覆盖
+            const generatedResolved = resolveFile(path.join(GENERATED_SRC, relPath));
+            if (generatedResolved) return { path: generatedResolved };
+
+            // Workers 覆盖
             const workersResolved = resolveFile(path.join(WORKERS_SRC, relPath));
             if (workersResolved) return { path: workersResolved };
 

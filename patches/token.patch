@@ -1,0 +1,84 @@
+--- a/restful/token.js
++++ b/restful/token.js
+@@ -1,3 +1,4 @@
++/** Workers 版 token 签发 */
+ import { ENV } from '@/vendor/open-api';
+ import { TOKENS_KEY, SUBS_KEY, FILES_KEY, COLLECTIONS_KEY } from '@/constants';
+ import { failed, success } from '@/restful/response';
+@@ -26,12 +27,8 @@
+ }
+ 
+ function generateShareToken() {
+-    if (ENV().isNode) {
+-        // The Node bundle inherits nanoid's browser entry from the first build pass.
+-        const nanoid = eval(`require("nanoid")`);
+-        return nanoid.customAlphabet(nanoid.urlAlphabet)();
+-    }
+-
++    // Workers 运行环境没有 Node 的 require，直接走 Web Crypto；
++    // 若宿主缺少 crypto 则退回 non-secure 实现（与上游行为对齐）。
+     try {
+         return customAlphabet(urlAlphabet)();
+     } catch {
+@@ -77,20 +74,11 @@
+ }
+ 
+ async function signToken(req, res) {
+-    if (!ENV().isNode && !ENV().isSubsCheckPro) {
+-        return failed(
+-            res,
+-            new RequestInvalidError(
+-                'INVALID_ENV',
+-                `This endpoint is only available in Node.js environment`,
+-            ),
+-        );
+-    }
++    // 允许 Workers 签发
+     try {
+         const tokenData = createTokenItem(req.body.payload, req.body.options);
+         return success(res, {
+             token: tokenData.token,
+-            // secret,
+         });
+     } catch (e) {
+         return failed(
+@@ -151,8 +139,6 @@
+     if (
+         !Number.isSafeInteger(exp) ||
+         exp <= 0 ||
+-        // Require an explicit millisecond Unix timestamp to avoid
+-        // silently accepting second-based values from non-frontend callers.
+         exp < 1000000000000
+     ) {
+         throw new RequestInvalidError(
+@@ -315,19 +301,18 @@
+                 `Invalid custom token: ${token}`,
+             );
+         }
++        // Workers 幂等更新：KV cacheTtl 可能导致前端 DELETE+POST 读到旧数据
++        // 遇到重复 token 时先删除旧的，再创建新的（而非报错）
+         const tokens = $.read(TOKENS_KEY) || [];
+-        if (
+-            tokens.find(
+-                (item) =>
+-                    item.token === token &&
+-                    item.type === type &&
+-                    item.name === name,
+-            )
+-        ) {
+-            throw new RequestInvalidError(
+-                'DUPLICATE_TOKEN',
+-                `Token ${token} already exists`,
+-            );
++        const existingIndex = tokens.findIndex(
++            (item) =>
++                item.token === token &&
++                item.type === type &&
++                item.name === name,
++        );
++        if (existingIndex >= 0) {
++            tokens.splice(existingIndex, 1);
++            $.write(tokens, TOKENS_KEY);
+         }
+     }
+ 

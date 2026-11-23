@@ -1,0 +1,7 @@
+--- a/core/app.js
++++ b/core/app.js
+@@ -1,4 +1,3 @@
+-import 'fastestsmallesttextencoderdecoder';
+ import { OpenAPI } from '@/vendor/open-api';
+ 
+ const $ = new OpenAPI('sub-store');

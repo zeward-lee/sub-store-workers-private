@@ -8,3 +8,4 @@ wrangler.toml
 scratch/
 .tasks/
 NUL
+.generated/
