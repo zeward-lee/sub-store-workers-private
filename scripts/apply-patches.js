@@ -6,14 +6,20 @@
  * 每个 patch 的目标路径取补丁头部的 b/ 路径，源文件为 <upstream>/<路径>。
  *
  * 严格策略（不允许任何"容错"路径产出成功状态）：
- * - 正式应用只用 git apply --whitespace=nowarn -C1 -p1 --directory=.generated；
- *   应用前先跑不带 -C 的 git apply --check（全部上下文必须精确匹配），
- *   预检失败即失败，杜绝 -C1 容忍上下文偏差后"成功"落地错误内容。
+ * - 预检与正式应用共用同一份参数数组 APPLY_ARGS（P1-1）：
+ *     ['apply', '--whitespace=nowarn', '-p1', '--directory=.generated']
+ *   不带任何 -C 参数，git apply 默认要求全部 context 行精确匹配；
+ *   预检 = APPLY_ARGS + '--check'；正式 = APPLY_ARGS。
+ * - 所有 git 调用固定 cwd=REPO_ROOT，--directory 用相对仓库根的 .generated（P1-2），
+ *   保证预检与正式作用在同一份干净副本上。
+ * - 每个 patch 的流程：读上游原文 -> 写 .generated/<target> -> sha256 一致性断言
+ *   -> 预检 -> 正式应用 -> 特征校验。
  * - 绝不使用 patch --fuzz 回退（fuzz 会忽略上下文错位并"成功"应用错误内容）。
  * - 任何失败：打印冲突详情 -> 删除 .generated -> exit 1（不留半成品）。
  * - 每次启动先删除 .generated 再重建，杜绝残留。
- * - 生成 .generated/.manifest.json 记录来源；esbuild 侧要求该文件存在。
- * - 应用成功后按 patches/<同名>.features.json 做特征行校验。
+ * - 生成 .generated/.manifest.json 记录来源与 patches 内容摘要；esbuild 侧要求
+ *   该文件存在且 patchesDigest 与当前 patches/ 一致。
+ * - 应用成功后按 patches/<同名>.features.json 做特征行校验（must_contain 必须非空）。
  * - 一个 patch 只能对应一个目标文件；同一目标不允许多个 patch。
  *
  * --verify-only：不重新应用，只对现有 .generated 跑特征校验（调试/CI 用）。
@@ -23,12 +29,20 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
+const { computePatchesDigest } = require('./lib/digest');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const GENERATED_DIR = path.join(REPO_ROOT, '.generated');
 const MANIFEST_FILE = path.join(GENERATED_DIR, '.manifest.json');
 const PATCH_DIR = path.join(REPO_ROOT, 'patches');
 const DEFAULT_UPSTREAM = path.resolve(REPO_ROOT, '..', 'Sub-Store', 'backend', 'src');
+
+/**
+ * P1-1：预检与正式应用共用的唯一参数来源。
+ * 不带 -C：git apply 默认要求全部 context 行精确匹配，零容错。
+ * --directory 固定为相对仓库根的 .generated（所有 git 调用 cwd=REPO_ROOT，P1-2）。
+ */
+const APPLY_ARGS = ['apply', '--whitespace=nowarn', '-p1', '--directory=.generated'];
 
 /** P2-2：统一按 LF 处理（CRLF / 孤立 CR 都归一为 LF） */
 function normalizeEol(text) {
@@ -145,7 +159,8 @@ function readPatchHeader(patchName, text) {
     return stripPrefix(newPath);
 }
 
-function run(cmd, args, cwd) {
+/** 所有 git 调用一律固定 cwd=REPO_ROOT（P1-2），确保 --directory=.generated 指向同一份副本 */
+function run(cmd, args, cwd = REPO_ROOT) {
     const res = spawnSync(cmd, args, { cwd, encoding: 'utf8' });
     return {
         status: res.status,
@@ -227,6 +242,13 @@ function readFeatures(patchName, targetRel) {
             `[invalid features] ${path.basename(
                 featuresFile,
             )}: must_contain / must_not_contain 必须是数组`,
+        );
+    }
+    // P1-3：must_contain 必须提供至少一个正向锚点，否则特征校验只剩"排除法"，拦不住错误产物
+    if (mustContain.length === 0) {
+        fail(
+            1,
+            `[invalid features] ${patchName}: must_contain 必须是非空数组（至少一个正向锚点）`,
         );
     }
     return { mustContain, mustNotContain };
@@ -328,11 +350,25 @@ function main() {
             fail(1, `[missing upstream] ${patchName}: ${sourceFile}`);
         }
 
-        // P2-2：源文件按 LF 落地
+        // P1-2：先把上游原文落到 .generated/<target>，形成唯一一份干净副本；
+        // 预检与正式应用都作用在这份副本上（cwd 固定 REPO_ROOT + --directory=.generated）。
         const upstreamText = normalizeEol(fs.readFileSync(sourceFile, 'utf8'));
         const destFile = path.join(GENERATED_DIR, targetRel);
         fs.mkdirSync(path.dirname(destFile), { recursive: true });
         fs.writeFileSync(destFile, upstreamText, 'utf8');
+
+        // P1-2：副本一致性断言——写入的内容必须与上游原文逐字节等价（sha256）
+        const upstreamSha = sha256(upstreamText);
+        const copySha = sha256(fs.readFileSync(destFile, 'utf8'));
+        if (copySha !== upstreamSha) {
+            fail(
+                1,
+                `[copy mismatch] ${patchName}: .generated/${targetRel} 与上游原文不一致\n` +
+                    `  target: .generated/${targetRel}\n` +
+                    `  expected sha256: ${upstreamSha.slice(0, 12)} (${sourceFile})\n` +
+                    `  actual   sha256: ${copySha.slice(0, 12)}`,
+            );
+        }
 
         const normalizedPatch = makeNormalizedPatch(patchName, text);
 
@@ -342,39 +378,20 @@ function main() {
                 console.error(`- ${r.patchName}: ${r.status}`);
             }
             printApplyFailure(patchName, targetRel, output);
-            fail(1, `\n[patch failed] ${patchName}: git apply 失败，已清理 .generated。`);
+            fail(
+                1,
+                `[patch failed] ${patchName}: git apply 失败，已清理 .generated。\n` +
+                    `上游 context 已变更，请基于新的上游文件重新生成 patches/${patchName}`,
+            );
         };
 
-        // P1-1：先做严格预检（-C 不带参数 = 全部上下文必须精确匹配，零容错）。
-        // 预检通过才进入正式应用；正式应用按约定使用 -C1，但上下文已被严格门锁死。
-        const strictCheck = run(
-            'git',
-            [
-                'apply',
-                '--whitespace=nowarn',
-                '-p1',
-                '--directory=.generated',
-                '--check',
-                normalizedPatch,
-            ],
-            REPO_ROOT,
-        );
+        // P1-1：预检与正式应用共用 APPLY_ARGS（不带 -C，全部 context 必须精确匹配）。
+        const strictCheck = run('git', [...APPLY_ARGS, '--check', normalizedPatch]);
         if (strictCheck.status !== 0) {
             failApply(`${strictCheck.stdout}${strictCheck.stderr}`);
         }
 
-        const gitResult = run(
-            'git',
-            [
-                'apply',
-                '--whitespace=nowarn',
-                '-C1',
-                '-p1',
-                '--directory=.generated',
-                normalizedPatch,
-            ],
-            REPO_ROOT,
-        );
+        const gitResult = run('git', [...APPLY_ARGS, normalizedPatch]);
 
         if (gitResult.status !== 0) {
             failApply(`${gitResult.stdout}${gitResult.stderr}`);
@@ -396,15 +413,16 @@ function main() {
         manifestItems.push({
             patch: patchName,
             target: targetRel,
-            upstreamSha: sha256(upstreamText),
+            upstreamSha,
         });
         results.push({ patchName, targetRel, status: 'ok (git apply + features)' });
     }
 
-    // P1-3：写 manifest（esbuild 要求存在才允许使用 .generated）
+    // P1-3/P1-4：写 manifest（esbuild 要求存在且 patchesDigest 与现行 patches/ 一致）
     const manifest = {
         generatedAt: new Date().toISOString(),
-        upstreamRoot: upstream,
+        upstreamRoot: path.resolve(upstream),
+        patchesDigest: computePatchesDigest(PATCH_DIR),
         items: manifestItems,
     };
     fs.writeFileSync(MANIFEST_FILE, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');

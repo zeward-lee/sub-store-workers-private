@@ -2,21 +2,45 @@
 const { build } = require('esbuild');
 const path = require('path');
 const fs = require('fs');
+const { computePatchesDigest } = require('./scripts/lib/digest');
 
 // 路径配置
 const WORKERS_SRC = path.resolve(__dirname, 'src');
 const GENERATED_SRC = path.resolve(__dirname, '.generated');
 const GENERATED_MANIFEST = path.join(GENERATED_SRC, '.manifest.json');
+const PATCH_DIR = path.resolve(__dirname, 'patches');
 const ORIGINAL_SRC = path.resolve(__dirname, '..', 'Sub-Store', 'backend', 'src');
 
 let generatedManifestChecked = false;
-/** .generated 产物必须有 manifest（由 scripts/apply-patches.js 生成），否则拒绝使用 */
+/**
+ * .generated 产物必须有 manifest（由 scripts/apply-patches.js 生成），否则拒绝使用。
+ * P1-4：同时校验 manifest.patchesDigest 与当前 patches/ 内容一致，
+ * 避免 patches 改了但 .generated 还是旧产物时静默构建出错误 content。
+ */
 function assertGeneratedManifest() {
     if (generatedManifestChecked) return;
     if (!fs.existsSync(GENERATED_MANIFEST)) {
         console.error(
             `[alias] ${GENERATED_MANIFEST} 不存在：.generated 产物来源不可信，拒绝使用。先运行 node scripts/apply-patches.js`,
         );
+        process.exit(1);
+    }
+    let manifest;
+    try {
+        manifest = JSON.parse(fs.readFileSync(GENERATED_MANIFEST, 'utf8'));
+    } catch (e) {
+        console.error(`[alias] ${GENERATED_MANIFEST} 无法解析：${e.message}。先运行 node scripts/apply-patches.js`);
+        process.exit(1);
+    }
+    let currentDigest;
+    try {
+        currentDigest = computePatchesDigest(PATCH_DIR);
+    } catch (e) {
+        console.error(`[stale .generated] patches 已变更，请先运行 node scripts/apply-patches.js (${e.message})`);
+        process.exit(1);
+    }
+    if (!manifest || manifest.patchesDigest !== currentDigest) {
+        console.error('[stale .generated] patches 已变更，请先运行 node scripts/apply-patches.js');
         process.exit(1);
     }
     generatedManifestChecked = true;

@@ -1,5 +1,5 @@
 {
   "target": "core/app.js",
-  "must_contain": [],
+  "must_contain": ["new OpenAPI('sub-store')"],
   "must_not_contain": ["fastestsmallesttextencoderdecoder"]
 }
