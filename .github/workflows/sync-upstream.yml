@@ -134,7 +134,7 @@ jobs:
         run: node scripts/apply-patches.js --upstream=../Sub-Store/backend/src
 
       - name: Check overridden files drift
-        if: steps.check.outputs.needed == 'true'
+        # 每次 run 都执行（含上游无更新的日子），保证漂移不会因 needed=false 被静默跳过
         working-directory: sub-store-workers
         run: node scripts/check-upstream-drift.js --upstream=../Sub-Store/backend/src
 
