@@ -128,6 +128,16 @@ jobs:
         working-directory: sub-store-workers
         run: npm ci
 
+      - name: Apply upstream patches
+        if: steps.check.outputs.needed == 'true'
+        working-directory: sub-store-workers
+        run: node scripts/apply-patches.js --upstream=../Sub-Store/backend/src
+
+      - name: Check overridden files drift
+        if: steps.check.outputs.needed == 'true'
+        working-directory: sub-store-workers
+        run: node scripts/check-upstream-drift.js --upstream=../Sub-Store/backend/src
+
       - name: Build worker
         if: steps.check.outputs.needed == 'true'
         working-directory: sub-store-workers
