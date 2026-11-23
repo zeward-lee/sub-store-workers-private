@@ -39,6 +39,7 @@ Sub-Store 后端的 Cloudflare Workers 移植版
 - [进阶配置 / 平台说明](#进阶配置--平台说明)（推送、环境变量、本地开发等，已折叠）
 - [FAQ](#faq)
 - [同步更新](#同步更新)
+- [补丁层与上游同步](#补丁层与上游同步)（上游冲突 / 漂移处理，维护者必看）
 - [Surge 面板脚本](#surge-面板脚本)
 - [致谢](#致谢) ｜ [许可证](#许可证)
 
@@ -46,21 +47,33 @@ Sub-Store 后端的 Cloudflare Workers 移植版
 <summary><b>架构说明</b>（如果你只想部署可跳过）</summary>
 
 ```
-sub-store-workers/src/        ← Workers 适配层（6 个文件）
-Sub-Store/backend/src/        ← 原始后端源码（直接复用）
-esbuild.js                    ← 构建脚本，通过插件桥接两者
+parent/
+├── Sub-Store/backend/src/        ← 上游原始后端源码（构建时直接复用）
+└── sub-store-workers/
+    ├── src/                      ← Workers 适配层（本项目自有文件）
+    │   ├── index.js              ← Workers 入口（对应上游 main.js 的启动脚本，不参与 patch）
+    │   ├── restful/miscs.js      ← 整文件覆盖：工具 API / 状态自检
+    │   ├── utils/env.js          ← 整文件覆盖：环境检测
+    │   └── vendor/               ← 平台替换层：express / open-api / quickjs / geoip / x-cache（6 个 js + 1 个 wasm）
+    ├── patches/                  ← 上游文件的补丁（core/app.js、restful/token.js）
+    ├── .generated/               ← 构建中间产物：上游原件 + 补丁结果（gitignore，不提交）
+    ├── scripts/                  ← 补丁应用、漂移检测、密钥轮换、运行时测试
+    ├── esbuild.js                ← 构建脚本：三级别名解析 + 4 个 esbuild 插件
+    └── wrangler.toml.example     ← 部署配置模板（复制为 wrangler.toml 后填 KV ID）
 ```
 
-仅替换了平台相关层，核心逻辑零修改：
+`@/` 导入按 **`.generated/` → `src/` → 上游 `src/`** 三级解析：需要改动上游文件的地方以补丁形式存放，构建前由 `npm run build` 的 `prebuild` 自动应用；只有平台层文件才整体覆盖。核心业务逻辑仍零修改。
 
-| Workers 文件 | 作用 |
-|---|---|
-| `vendor/open-api.js` | KV 替换 fs，fetch 替换 undici |
-| `vendor/express.js` | Workers fetch handler 替换 Node express |
-| `core/app.js` | 导入 Workers 版 OpenAPI |
-| `utils/env.js` | 环境检测 |
-| `restful/token.js` | 允许 Workers 签发 token |
-| `index.js` | Workers 入口 |
+| 文件 / 目录 | 来源 | 作用 |
+|---|---|---|
+| `src/vendor/open-api.js` | 本项目 | KV 替换 fs，fetch 替换 undici |
+| `src/vendor/express.js` | 本项目 | Workers fetch handler 替换 Node express |
+| `src/vendor/quickjs-executor.js` | 本项目 | QuickJS WASM 替换 runtime `new Function()` |
+| `src/restful/miscs.js` | 本项目（整文件覆盖） | 工具 API：`/api/utils/env`、`/api/utils/worker-status`、Gist 备份 |
+| `src/utils/env.js` | 本项目（整文件覆盖） | 环境检测（`isWorker = true`） |
+| `patches/core-app.patch` | 上游原件 + 补丁 → `.generated/core/app.js` | 去掉 Workers 不需要的 polyfill import |
+| `patches/token.patch` | 上游原件 + 补丁 → `.generated/restful/token.js` | 允许 Workers 签发 token、重复 token 幂等覆盖 |
+| `src/index.js` | 本项目 | Workers 入口（对应上游 `main.js`） |
 
 更详细的项目总图见 [`mydocs/codemap/project-overview.md`](mydocs/codemap/project-overview.md)。
 
@@ -102,13 +115,19 @@ npx wrangler login
 npx wrangler kv namespace create SUB_STORE_DATA
 ```
 
-将返回的 `id` 填入 `wrangler.toml`：
+先复制配置模板，再把返回的 `id` 填入 `wrangler.toml`：
+
+```bash
+cp wrangler.toml.example wrangler.toml
+```
 
 ```toml
 [[kv_namespaces]]
 binding = "SUB_STORE_DATA"
 id = "你的KV命名空间ID"
 ```
+
+> 仓库只提交 `wrangler.toml.example` 模板，`wrangler.toml` 已在 `.gitignore` 中，不会被误提交。
 
 ### 4. 构建 & 部署
 
@@ -332,7 +351,7 @@ https://你的域名/你的密码/api/utils/worker-status
 
 | 插件 | 作用 |
 |---|---|
-| `路径别名解析` | 解析 `@/` 导入，优先 Workers 覆盖 |
+| `路径别名解析` | 解析 `@/` 导入，按 `.generated` → `src` → 上游三级顺序命中（命中 `.generated` 前校验 manifest 摘要） |
 | `eval 重写` | 将 eval() 调用替换为静态表达式 |
 | `peggy 预编译` | 构建时编译 PEG 文法，消除运行时 eval |
 | `Node 模块存根` | 存根 fs/crypto 等不可用模块 |
@@ -460,7 +479,9 @@ cd ../sub-store-workers
 npm run deploy
 ```
 
-esbuild 构建时会从 `Sub-Store/backend/src/` 读取最新源码，重新 build 即可包含新功能。
+esbuild 构建时会从 `Sub-Store/backend/src/` 读取最新源码。`npm run build` 的 `prebuild` 会先自动执行 `node scripts/apply-patches.js`，把 `patches/*.patch` 应用到上游原件并生成 `.generated/`（这一层 `@/` 优先级最高），随后才进入 bundle，所以重新 build 即可包含上游新功能。
+
+> **补丁冲突会明确失败，不会静默上线旧版**：若上游改动了补丁涉及的行（`core/app.js`、`restful/token.js`），`apply-patches` 会因上下文不匹配而 `exit 1`，`npm run build` 随之失败并清空 `.generated/`。处理流程见[补丁层与上游同步](#补丁层与上游同步)。
 
 </details>
 
@@ -474,15 +495,21 @@ esbuild 构建时会从 `Sub-Store/backend/src/` 读取最新源码，重新 bui
 ```
 每天 00:00（北京时间）自动触发
   ↓
-拉取上游最新 commit，对比已部署版本
-  ↓ 有更新
-安装依赖 → 运行上游测试套件
+Checkout 两个仓库 → 读上下游版本/SHA → 判断是否需要更新（无更新则只跑漂移检测）
+  ↓ 需要更新
+Setup Node → 安装上游依赖 + 运行上游测试 → 安装 workers 依赖
   ↓ 测试通过
-构建 → 部署 Workers → 部署 Pages → 健康检查
+Apply upstream patches（补丁冲突即失败）→ 检测整文件覆盖层漂移（每日必跑，不受更新判断限制）
+  ↓
+Build worker → 检查 bundle 体积（gzip 3 MiB 免费上限 / 10 MiB 硬上限）
+  ↓
+生成 wrangler.toml → Deploy Workers → 打包并 Deploy Pages → 设置 Pages 环境变量
+  ↓
+健康检查 → 写 job summary → 更新 .upstream-sha
   ↓ 全部成功
-记录已部署版本 + Bark 通知
+Bark 通知"同步成功"
 
-任何环节失败 → Bark 通知"同步失败"，线上版本不受影响
+任何环节失败 → Bark 通知"同步失败" + 自动开 Issue（同类问题评论去重），线上版本不受影响
 ```
 
 #### 配置步骤
@@ -525,6 +552,7 @@ Account Resources 选择 **Include → 你的账号**。
 |---|---|---|
 | **上游测试未通过** | 不会部署，线上不受影响 | 等上游修复后下次自动重试 |
 | **构建失败**（上游引入了 Workers 不兼容的 API） | 不会部署 | 需要手动适配 `src/` 覆盖层，提 issue |
+| **补丁应用失败**（上游改动命中 `patches/` 涉及的行） | 构建失败、不会部署 | 按[补丁层与上游同步](#补丁层与上游同步)的 SOP 基于新上游重新生成补丁 |
 | **Cloudflare API 超时/限流** | 部署中断 | 下次自动重试 |
 | **API Token 过期或权限不足** | 部署失败 | 重新创建 Token 并更新 GitHub Secret |
 | **上游大版本重构**（目录结构变化） | 构建失败 | 需要手动更新 esbuild 配置 |
@@ -535,6 +563,78 @@ Account Resources 选择 **Include → 你的账号**。
 > **手动触发**：任何时候都可以在 Actions 页面手动 Run workflow，`force = true` 会跳过版本检查强制部署。
 
 </details>
+
+---
+
+## 补丁层与上游同步
+
+有些上游文件必须改动才能跑在 Workers 上，但改动量小、希望继续跟进上游。这类文件不放整份副本，而是存「相对上游原件的补丁」，构建时自动应用。
+
+### 两类移植方式
+
+| 类型 | 文件 | 方式 |
+|---|---|---|
+| 上游几乎不改，但 Workers 完全不适用 | `restful/miscs.js`、`utils/env.js` | **整文件覆盖**：直接由 `src/` 命中，靠漂移检测盯上游是否变动 |
+| 只差几行，需要继续跟随上游演进 | `core/app.js`、`restful/token.js` | **补丁**：`.generated/` 中存放「上游原件 + `patches/` 应用结果」 |
+
+`@/` 解析顺序固定三级：
+
+```
+@/xxx → .generated/xxx（上游原件 + 补丁；命中前校验 manifest 与 patchesDigest）
+      → src/xxx（本项目整文件覆盖）
+      → ../Sub-Store/backend/src/xxx（上游原始文件）
+```
+
+### 补丁机制
+
+- `.generated/` 由 `scripts/apply-patches.js` 生成，已 gitignore；每次运行先整个目录删除再重建，不留残留。
+- 预检 `git apply --check` 与正式应用共用同一组参数 `apply --whitespace=nowarn -p1 --directory=.generated`，**不带 `-C`**：全部上下文行必须精确匹配，不允许 fuzz 把错误内容"成功"应用。
+- 应用前先把上游原件写入 `.generated/<target>` 并做 sha256 一致性断言；应用后校验产物为 LF 换行。
+- 每个补丁配 `<同名>.features.json`：`must_contain` 必须是**非空数组**（正向锚点，缺失即失败），`must_not_contain` 可选。应用后逐条校验，不满足即清空 `.generated/` 并 `exit 1`。
+- 应用成功后写 `.generated/.manifest.json`，其中 `patchesDigest` 是 `patches/` 下所有 `.patch` 与 `.features.json` 内容的摘要。esbuild 在使用 `.generated` 前会重算摘要，manifest 缺失或摘要不一致即 `exit 1`，防止"改了补丁却拿旧产物构建"。
+- `npm run build` 的 `prebuild` 自动执行 apply-patches，无法绕过。
+
+### 上游冲突后的 SOP
+
+1. **定位失败补丁**：看 workflow 失败 Issue 里的 Run 链接，或本地跑 `node scripts/apply-patches.js`，输出会打印 `[patch failed] <name>` 以及冲突行附近的上下文。
+2. **对齐新上游**：`cd Sub-Store && git pull`，然后手工把 `.generated/<target>` 调整成期望结果（等于"在新上游上重做一遍适配"）。
+3. **重新生成补丁**：基于新的上游原文件用 `diff -u` 生成，路径头保持 `a/`、`b/`：
+
+   ```bash
+   diff -u ../Sub-Store/backend/src/core/app.js .generated/core/app.js \
+     | sed -e '1s|.*|--- a/core/app.js|' -e '2s|.*|+++ b/core/app.js|' \
+     > patches/core-app.patch
+   ```
+
+4. **更新锚点**：若上游改了关键函数名/字符串，同步更新 `patches/<name>.features.json` 的 `must_contain` / `must_not_contain`。
+5. **本地验证**：`node scripts/apply-patches.js` 与 `npm run build` 都必须成功。
+6. **提交推送**：提交 `patches/` 变更（`.generated/` 不入库），工作流下次运行即用新补丁构建。
+
+### 漂移检测（整文件覆盖层）
+
+`scripts/check-upstream-drift.js` 用 `git hash-object` 比对 `.upstream-watch.json` 中记录的 blob SHA：
+
+- 每日 workflow 都会执行（不受"是否需要更新"限制），**永不阻断构建**，只在日志与 job summary 给出 `::warning::`。
+- `DRIFT`（上游已变）或 `MISSING SHA`（新增文件未记录）时，人工把 `src/` 覆盖层同步到新上游行为，再回写记录：
+
+  ```bash
+  node scripts/check-upstream-drift.js --update restful/miscs.js --upstream=../Sub-Store/backend/src
+  ```
+
+  可重复 `--update` 指定多个文件；写入 `.upstream-watch.json` 后一并提交。
+- `CHECK ERROR` 表示无法计算上游 SHA（git 环境问题），与漂移分开归类，先修环境再重跑。
+
+### 本地验证命令
+
+```bash
+node scripts/apply-patches.js                    # 只应用补丁，产出 .generated/
+node scripts/apply-patches.js --verify-only      # 不重新应用，只校验现有产物的特征锚点
+node scripts/check-upstream-drift.js             # 漂移检测（非阻断）
+node scripts/check-upstream-drift.js --update <file> --upstream=../Sub-Store/backend/src
+npm run build                                    # prebuild 自动 apply-patches，然后 bundle
+```
+
+补丁本身的维护细节（用途、生成命令、features 格式、失败排查）见 [`patches/README.md`](patches/README.md)。
 
 ---
 

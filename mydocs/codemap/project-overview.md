@@ -1,6 +1,6 @@
 # Sub-Store Workers 项目总图
 
-> 生成时间: 2026-04-23 15:11（最近更新: 2026-04-25）
+> 生成时间: 2026-04-23 15:11（最近更新: 2026-11-23）
 > 项目: sub-store-workers
 > 类型: project-level codemap
 
@@ -32,21 +32,25 @@
 
 | 文件 | 职责 |
 |---|---|
-| `src/index.js` | **Workers 入口**：CORS 预检、KV 绑定校验、路径前缀鉴权（含未配置警告头）、KV 初始化、路由分发、Cron 定时同步 |
+| `src/index.js` | **Workers 入口**（对应上游 `main.js` 的 43 行启动脚本，不参与 patch）：CORS 预检、KV 绑定校验、路径前缀鉴权（含未配置警告头）、KV 初始化、路由分发、Cron 定时同步 |
 | `src/vendor/express.js` | **Express 适配**：将 Workers fetch handler 适配为类 Express 的 req/res 路由 |
 | `src/vendor/open-api.js` | **OpenAPI 适配**：KV 替代 fs 存储、fetch 替代 undici、日志/通知/推送 |
-| `src/core/app.js` | 单例 `$` 导出（`new OpenAPI('sub-store')`） |
-| `src/utils/env.js` | 环境检测变量，`backend = 'Workers'`，`isWorker = true` |
-| `src/restful/miscs.js` | 工具 API：`/api/utils/env`（暴露 `SUB_STORE_*` 给前端）、`/api/utils/worker-status`（KV/鉴权/能力诊断）、Gist 备份/还原、存储管理、刷新 |
-| `src/restful/token.js` | Token 签发/删除（Workers 版，替换上游 JWT 方案为 nanoid） |
-| `src/vendor/quickjs-executor.js` | **QuickJS 脚本沙箱**：替代上游 `new Function()` 执行用户脚本（Script Operator/Filter），支持 func / nodeFunc / content 三种模式，详见 4.4 |
+| `src/vendor/quickjs-executor.js` | **QuickJS 脚本沙箱**：替代上游 `new Function()` 执行用户脚本（Script Operator/Filter），支持 func / nodeFunc / content 三种模式，详见 4.5 |
+| `src/vendor/quickjs-timeout.js` | **脚本时间预算中断器**：deadline 式 `setInterruptHandler`，替代旧的指令计数式超时（避免跨脚本残余计数误杀） |
+| `src/vendor/quickjs.wasm` | QuickJS 引擎二进制，由 Wrangler 作为原生 WASM module 上传 |
+| `src/vendor/geoip-czdb.js` | **脚本内 GeoIP**：从节点提取 IP 字面量，批量查 czdb 接口后注入同步 `geoip.lookup()`；`GEOIP_CZDB_BASE` 可覆盖或置 `off` 关闭 |
+| `src/vendor/x-cache.js` | **`/download` 下载缓存层**：Cache API + KV 双层（含 stale-on-error 兜底）、自学习预热清单、"保存即作废"失效机制 |
+| `src/utils/env.js` | 环境检测变量，`backend = 'Workers'`，`isWorker = true`（**整文件覆盖**） |
+| `src/restful/miscs.js` | 工具 API：`/api/utils/env`（暴露 `SUB_STORE_*` 给前端）、`/api/utils/worker-status`（KV/鉴权/能力诊断）、Gist 备份/还原、存储管理、刷新（**整文件覆盖**） |
+
+> `src/core/app.js`、`src/restful/token.js` **已不在 `src/` 中**：它们由 `patches/` 基于上游原件打补丁后生成到 `.generated/`，详见 4.3。
 
 ### 3.2 构建层
 
 | 文件 | 职责 |
 |---|---|
 | `esbuild.js` | **构建脚本**：4 个 esbuild 插件桥接 Workers 与上游源码；同时把上游 `createDynamicFunction` 替换为 QuickJS 沙箱执行（`SCRIPT_ENGINE=disabled` 可关闭） |
-| `wrangler.toml` | Workers 部署配置：KV 绑定、Cron、环境变量（路径密码推荐改用 Worker Secret） |
+| `wrangler.toml.example` | Workers 部署配置模板：KV 绑定、Cron、环境变量（路径密码推荐改用 Worker Secret）。仓库不提交 `wrangler.toml`，部署前需 `cp wrangler.toml.example wrangler.toml` 并填 KV ID |
 | `package.json` | 依赖与脚本（`deploy`、`deploy:pages`、`rotate-secret`、`rotate-secret:sh`） |
 
 ### 3.3 运维脚本（`scripts/`）
@@ -55,10 +59,24 @@
 |---|---|
 | `scripts/rotate-secret.ps1` | Windows PowerShell：生成随机 URL-safe 密码，通过管道写入 Cloudflare Worker Secret `SUB_STORE_FRONTEND_BACKEND_PATH`，并复制到剪贴板 |
 | `scripts/rotate-secret.sh` | Linux/macOS Bash：同上，自动选择 `pbcopy`/`wl-copy`/`xclip`/`xsel` |
+| `scripts/apply-patches.js` | 把 `patches/*.patch` 应用到上游原件，生成 `.generated/` 与 `.manifest.json`；支持 `--upstream=<dir>`、`--verify-only` |
+| `scripts/check-upstream-drift.js` | 整文件覆盖层的上游漂移检测（git blob SHA 对比 `.upstream-watch.json`）；`--update <file>` 回写记录，检测模式永不阻断 |
+| `scripts/lib/digest.js` | 计算 `patches/` 内容摘要 `patchesDigest`，供 apply-patches 写 manifest、esbuild 判定 `.generated` 是否过期 |
+| `scripts/test-geoip-czdb.mjs` | `src/vendor/geoip-czdb.js` 的运行时单测（fake fetch/env） |
+| `scripts/test-quickjs-timeout.mjs` | `src/vendor/quickjs-timeout.js` 的时间预算中断器单测 |
+| `scripts/test-x-cache.mjs` | `src/vendor/x-cache.js` 下载缓存层单测（fake Cache API / KV / fetch） |
 
 ### 3.4 上游源码（构建时引入，`../Sub-Store/backend/src/`）
 
-通过 esbuild `@/` 别名解析：**Workers `src/` 优先 → 回退到上游 `src/`**。
+通过 esbuild `@/` 别名解析，**三级顺序**：
+
+```
+@/xxx → .generated/xxx（上游原件 + patches 结果）
+      → src/xxx（本项目整文件覆盖）
+      → ../Sub-Store/backend/src/xxx（上游原始文件）
+```
+
+命中 `.generated/` 前，esbuild 会校验 `.generated/.manifest.json` 存在且其 `patchesDigest` 与当前 `patches/` 内容摘要一致；manifest 缺失、无法解析或摘要不同即 `exit 1`，防止用过期产物构建。
 
 关键上游模块：
 - `restful/subscriptions` — 订阅 CRUD
@@ -109,17 +127,41 @@ scheduled() → cronSyncArtifacts()
   └─ $.persistCache()
 ```
 
-### 4.3 esbuild 构建管线
+### 4.3 补丁层与漂移检测
+
+上游有四个文件需要适配，但策略不同：
+
+| 目标 | 策略 | 存放位置 |
+|---|---|---|
+| `core/app.js` | 补丁（去掉 polyfill import） | `patches/core-app.patch` → `.generated/core/app.js` |
+| `restful/token.js` | 补丁（Workers 签 token + 重复 token 幂等覆盖） | `patches/token.patch` → `.generated/restful/token.js` |
+| `restful/miscs.js`、`utils/env.js` | 整文件覆盖 | `src/` |
+
+```
+npm run build
+  └─ prebuild: node scripts/apply-patches.js
+       ├─ 清空 .generated/ 并重建
+       ├─ 逐 patch：上游原件 → .generated/<target>（sha256 一致性断言）
+       ├─ git apply --check（与正式应用共用 APPLY_ARGS，不带 -C / 无 fuzz）
+       ├─ git apply 正式应用 → 校验产物 LF
+       ├─ 特征校验 patches/<同名>.features.json（must_contain 必须非空）
+       └─ 写 .generated/.manifest.json（patchesDigest）
+  └─ esbuild：命中 .generated 前校验 manifest 与 patchesDigest
+```
+
+失败路径：任一环节不满足即**清空 `.generated/` 并 `exit 1`**，构建中止（不会静默使用旧版/错误产物）。整文件覆盖层另由 `scripts/check-upstream-drift.js` 每日检测（不阻断构建），漂移后用 `--update <file>` 回写 `.upstream-watch.json`。完整 SOP 见 [`patches/README.md`](../../patches/README.md) 与 README「补丁层与上游同步」。
+
+### 4.4 esbuild 构建管线
 
 ```
 esbuild.js
-  ├─ aliasPlugin: @/ → Workers src/ 优先，回退上游 src/
+  ├─ aliasPlugin: @/ → .generated/（校验 manifest）→ src/ → 上游 src/
   ├─ peggyPrecompilePlugin: PEG 语法 → 预编译 JS 解析器
   ├─ evalRewritePlugin: eval() → Workers 兼容替换
   └─ nodeStubPlugin: Node 模块 → Proxy 存根
 ```
 
-### 4.4 QuickJS 脚本执行（Script Operator/Filter）
+### 4.5 QuickJS 脚本执行（Script Operator/Filter）
 
 上游用 `new Function()` 动态执行用户脚本，Workers 禁止运行时代码生成，改用 QuickJS WASM 沙箱（`src/vendor/quickjs-executor.js`）。按输入类型分三种模式：
 
