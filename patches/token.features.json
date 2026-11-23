@@ -1,0 +1,5 @@
+{
+  "target": "restful/token.js",
+  "must_contain": ["consumeShareTokenForRequest"],
+  "must_not_contain": ["isSubsCheckPro"]
+}

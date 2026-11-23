@@ -4,6 +4,7 @@
   "description": "Sub-Store on Cloudflare Workers",
   "private": true,
   "scripts": {
+    "prebuild": "node scripts/apply-patches.js",
     "build": "node esbuild.js",
     "dev": "wrangler dev",
     "deploy": "npm run build && wrangler deploy",

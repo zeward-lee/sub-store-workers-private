@@ -1,0 +1,5 @@
+{
+  "target": "core/app.js",
+  "must_contain": [],
+  "must_not_contain": ["fastestsmallesttextencoderdecoder"]
+}

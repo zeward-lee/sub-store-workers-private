@@ -6,7 +6,21 @@ const fs = require('fs');
 // 路径配置
 const WORKERS_SRC = path.resolve(__dirname, 'src');
 const GENERATED_SRC = path.resolve(__dirname, '.generated');
+const GENERATED_MANIFEST = path.join(GENERATED_SRC, '.manifest.json');
 const ORIGINAL_SRC = path.resolve(__dirname, '..', 'Sub-Store', 'backend', 'src');
+
+let generatedManifestChecked = false;
+/** .generated 产物必须有 manifest（由 scripts/apply-patches.js 生成），否则拒绝使用 */
+function assertGeneratedManifest() {
+    if (generatedManifestChecked) return;
+    if (!fs.existsSync(GENERATED_MANIFEST)) {
+        console.error(
+            `[alias] ${GENERATED_MANIFEST} 不存在：.generated 产物来源不可信，拒绝使用。先运行 node scripts/apply-patches.js`,
+        );
+        process.exit(1);
+    }
+    generatedManifestChecked = true;
+}
 
 /** 插件：路径别名解析 */
 function resolveFile(basePath) {
@@ -39,7 +53,10 @@ const aliasPlugin = {
             const relPath = args.path.slice(2); // strip "@/"
 
             const generatedResolved = resolveFile(path.join(GENERATED_SRC, relPath));
-            if (generatedResolved) return { path: generatedResolved };
+            if (generatedResolved) {
+                assertGeneratedManifest();
+                return { path: generatedResolved };
+            }
 
             // Workers 覆盖
             const workersResolved = resolveFile(path.join(WORKERS_SRC, relPath));
