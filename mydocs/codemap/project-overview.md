@@ -151,6 +151,8 @@ npm run build
 
 失败路径：任一环节不满足即**清空 `.generated/` 并 `exit 1`**，构建中止（不会静默使用旧版/错误产物）。整文件覆盖层另由 `scripts/check-upstream-drift.js` 每日检测（不阻断构建），漂移后用 `--update <file>` 回写 `.upstream-watch.json`。完整 SOP 见 [`patches/README.md`](../../patches/README.md) 与 README「补丁层与上游同步」。
 
+> **维护约束**：`esbuild.js` 的 `evalRewritePlugin` 只对上游原文件（`ORIGINAL_SRC`）生效，**不处理 `.generated/` 下的补丁产物**。因此补丁目标文件内不能保留 `eval(require(...))` 这类写法——它会原样进入 bundle 并在 Workers 运行时抛错；上游若新增此类写法，需在补丁里同步移除或改写（`token.patch` 已删除上游的 `eval(require('nanoid'))` 分支）。
+
 ### 4.4 esbuild 构建管线
 
 ```

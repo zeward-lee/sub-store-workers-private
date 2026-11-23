@@ -91,6 +91,14 @@ error: patch failed: core/app.js:1
 原因：改了 `patches/` 但没重新应用，`.generated/` 还是旧产物。
 处理：`node scripts/apply-patches.js`（或直接 `npm run build`，`prebuild` 会自动跑）。
 
+## 维护约束
+
+**补丁产物的目标文件里不能出现 `eval(require(...))` 之类的动态 `eval` 写法。**
+
+- 原因：`esbuild.js` 的 `evalRewritePlugin`（`onLoad` 过滤 `.js`，开头即 `if (!args.path.startsWith(ORIGINAL_SRC)) return null`）**只改写上游原文件**，不处理 `.generated/` 下的补丁产物。补丁产物里保留这类写法，会原样进入 bundle，在 Workers 运行时直接抛错（Workers 禁止运行时 `eval` / `new Function`）。
+- 现状无影响：`token.patch` 已删除上游原来的 `eval(require("nanoid"))` 分支，改走 Web Crypto / `customAlphabet`。
+- 上游未来若在补丁目标文件中新增同类写法，**必须在补丁里同步移除或改写**，不能指望构建时的 eval 重写兜底——它是按路径白名单生效的，`.generated/` 不在其中。
+
 ## 常用命令
 
 ```bash
